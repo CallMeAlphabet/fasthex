@@ -2,12 +2,24 @@
 
 fasthex – a very fast hex dumper (written in Rust)
 
+## Benchmarks (790 MiB file)
+
+| Tool | Time | Speed vs fasthex |
+|------|------|------------------|
+| **fasthex** | **0.57s** | **1x (baseline)** |
+| xxd | 16.84s | 30x slower |
+| hexyl | 40.34s | 71x slower |
+| hexdump | 53.67s | 95x slower |
+
+*Tested on i5-7500T with file (not in RAM) redirected to /dev/null*
+*All commands were executed without any additional flags, all redirected to /dev/null*
+
 ## How to set it up
 
 1. Install `cargo` (and optionally `time`)
 2. Clone this repo (It'll put everything into `~/fasthex` automatically):
 ```bash
-git clone https://CallMeAlphabet/fasthex
+git clone https://github.comCallMeAlphabet/fasthex
 ```
 3. Compile, put into `~/.local/bin`
 ```bash
