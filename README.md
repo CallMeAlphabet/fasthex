@@ -20,14 +20,22 @@ Speed advantages:
   6. Streaming (stdin) path uses a 4 MiB write buffer.
 
 Row layout – 76 bytes:
-  [0..7]   8-digit hex offset
-  [8]      ' '
-  [9..32]  hex group-1  (8 bytes × "XX ")
-  [33]     extra gap space
-  [34..57] hex group-2  (8 bytes × "XX ")
-  [58]     ' '
-  [59..74] ASCII printable / '.'
-  [75]     '\n'
+
+`  [0..7]   8-digit hex offset`
+
+`  [8]      ' '`
+  
+`  [9..32]  hex group-1  (8 bytes × "XX ")`
+  
+`  [33]     extra gap space`
+  
+`  [34..57] hex group-2  (8 bytes × "XX ")`
+  
+`  [58]     ' '`
+  
+`  [59..74] ASCII printable / '.'`
+  
+`  [75]     '\n'`
 
 NOTE: the offset field is u32, so files larger than 4 GiB will have a
 wrapping offset display. Known limitation.
