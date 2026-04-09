@@ -2,7 +2,37 @@
 
 fasthex – a very fast hex dumper
 
-Speed advantages:
+## How to set it up
+
+1. Install `cargo` (and optionally `time`)
+2. Clone this repo (It'll put everything into `~/fasthex` automatically):
+```bash
+git clone https://CallMeAlphabet/fasthex
+```
+3. Compile, put into `~/.local/bin`
+```bash
+cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/fasthex
+```
+4. Clean up
+```bash
+rm -rf ~/fasthex
+```
+5. Test it
+```bash
+# Normal test
+time fasthex ~/path/to/file
+
+# Pipe it (faster, vmsplice, kernel pipe)
+time fasthex ~/path/to/file > /dev/null
+
+# Put into RAM (slow SSDs / HDDs can bottleneck a lot)
+sudo mkdir -p /mnt/ramdisk
+sudo mount -t tmpfs -o size=[MAKE SURE YOUR FILE FITS] tmpfs /mnt/ramdisk                                                                                                              cp ~/path/to/file /mnt/ramdisk/
+time fasthex /mnt/ramdisk/file > /dev/null
+```
+NOTE: If you need `sudo`, you may need to use the full path to `fasthex`.
+
+## Speed advantages:
   1. mmap path: output formatted in parallel with rayon in 64 MiB chunks.
   2. AVX2 path: processes 32 bytes (2 rows) per SIMD call; falls back to
      SSE4.1/SSSE3 (16 bytes / 1 row) or scalar.
