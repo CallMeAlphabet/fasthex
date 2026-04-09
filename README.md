@@ -69,3 +69,6 @@ Row layout – 76 bytes:
 
 NOTE: the offset field is u32, so files larger than 4 GiB will have a
 wrapping offset display. Known limitation.
+
+
+This repo is not actively maintained as (1) `fasthex` is fast enough and (2) I have other projects and (3) this was just an experiment. 
