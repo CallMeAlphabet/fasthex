@@ -19,7 +19,7 @@ fasthex – a very fast hex dumper (written in Rust)
 1. Install `cargo` (and optionally `time`)
 2. Clone this repo (It'll put everything into `~/fasthex` automatically):
 ```bash
-git clone https://github.comCallMeAlphabet/fasthex
+git clone https://github.com/CallMeAlphabet/fasthex
 ```
 3. Compile, put into `~/.local/bin`
 ```bash
