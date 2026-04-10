@@ -61,7 +61,7 @@ NOTE: If you need `sudo`, you may need to use the full path to `fasthex`.
      if splice rejects the stdout fd (e.g. a tty).
   6. Streaming (stdin) path uses a 4 MiB write buffer.
 
-Row layout – 76 bytes:
+Standard row layout – 76 bytes:
 
 `  [0..7]   8-digit hex offset`
 
