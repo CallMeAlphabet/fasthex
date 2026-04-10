@@ -2,7 +2,7 @@
 
 fasthex – a very fast hex dumper (written in Rust)
 
-## Benchmarks (790 MiB file)
+## Benchmarks (780 MiB file)
 
 | Tool | Time | Speed vs fasthex |
 |------|------|------------------|
@@ -10,6 +10,13 @@ fasthex – a very fast hex dumper (written in Rust)
 | xxd | 16.84s | 30x slower |
 | hexyl | 40.34s | 71x slower |
 | hexdump | 53.67s | 95x slower |
+
+## Benchmark 2 (69GiB file)
+
+| Tool | Time |
+|------|------|
+| fasthex | ~1m |
+| hexyl | ~1h 30m |
 
 *Tested on i5-7500T with file not being in RAM disk redirected to /dev/null.*
 *All commands were executed without any additional flags.*
