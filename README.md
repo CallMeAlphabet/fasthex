@@ -31,6 +31,9 @@ rm -rf ~/fasthex
 ```
 5. Test it
 ```bash
+# Get help:
+fasthex -h
+
 # Normal test
 time fasthex ~/path/to/file
 
@@ -82,5 +85,29 @@ Standard row layout – 76 bytes:
 NOTE: the offset field is u32, so files larger than 4 GiB will have a
 wrapping offset display. Known limitation.
 
+```bash
+◄ 0s ◎ fasthex -h                                                                                                                                                       
+Usage:
+ fasthex [options] <file>.
 
-This repo is not actively maintained as (1) `fasthex` is fast enough and (2) I have other projects and (3) this was just an experiment. 
+Options:
+ -b, --one-byte-octal      one-byte octal display
+ -X, --one-byte-hex        one-byte hexadecimal display
+ -c, --one-byte-char       one-byte character display
+ -d, --two-bytes-decimal   two-byte decimal display
+ -o, --two-bytes-octal     two-byte octal display
+ -x, --two-bytes-hex       two-byte hexadecimal display
+ -L, --color[=<hexValue>]  color the output
+ -n, --length <length>     interpret only length bytes of input
+ -s, --skip <offset>       skip offset bytes from the beginning
+ -w, --with-squeezing      do not output identical lines
+ -i, --no-ascii            do not display ascii
+ -a, --binary              binary display
+ -v, --version             display version (always outputs 2.0)
+ -h, --help                display this help page
+
+Arguments:
+ Values for <length> and <offset> may be followed by a suffix: KiB, MiB,
+ GiB, TiB, PiB, EiB, ZiB, or YiB (where the "iB" is optional).
+                                                                                                                                                                               
+◄ 0s ◎ echo "This repo is not actively maintained as `fasthex` is fast enough and I have other projects. Maybe some features will be added in the future! And yes, I had to put this into an 'echo "[...]"', because I couldn't close the code block for some reason. And it looked really weird putting that note into a code block. So I decided that I should echo it. I'm weird."
