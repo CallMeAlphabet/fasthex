@@ -17,13 +17,17 @@ fasthex – a very fast hex dumper (written in Rust)
 ## How to set it up
 
 1. Install `cargo` (and optionally `time`)
-2. Clone this repo (It'll put everything into `~/fasthex` automatically):
+2. Clone this repo (It'll put everything into `~/fasthex` automatically)
 ```bash
 git clone https://github.com/CallMeAlphabet/fasthex
 ```
 3. Compile, put into `~/.local/bin`
 ```bash
-cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/fasthex && cd ~
+cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/ && cd ~
+```
+Or, if `~/.local/bin/` isn't in PATH and you don't want to put `~/.local/bin` in PATH
+```bash
+cp ~/fasthex/target/release/fasthex /usr/bin && cd ~
 ```
 4. Clean up
 ```bash
