@@ -11,7 +11,7 @@ fasthex – a very fast hex dumper (written in Rust)
 | hexyl | 40.34s | 71x slower |
 | hexdump | 53.67s | 95x slower |
 
-*Tested on i5-7500T with file not in RAM disk redirected to /dev/null.*
+*Tested on i5-7500T with file not being in RAM disk redirected to /dev/null.*
 *All commands were executed without any additional flags.*
 
 ## How to set it up
