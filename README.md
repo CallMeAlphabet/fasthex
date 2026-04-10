@@ -25,7 +25,7 @@ git clone https://github.com/CallMeAlphabet/fasthex
 ```bash
 cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/ && cd ~
 ```
-Or, if `~/.local/bin/` isn't in PATH and you don't want to put `~/.local/bin` in PATH
+Or, if `~/.local/bin` isn't in PATH and you don't want to put `~/.local/bin` in PATH
 ```bash
 cp ~/fasthex/target/release/fasthex /usr/bin && cd ~
 ```
@@ -49,7 +49,7 @@ sudo mkdir -p /mnt/ramdisk
 sudo mount -t tmpfs -o size=[MAKE SURE YOUR FILE FITS] tmpfs /mnt/ramdisk                                                                                                              cp ~/path/to/file /mnt/ramdisk/
 time fasthex /mnt/ramdisk/file > /dev/null
 ```
-NOTE: If you need `sudo`, you may need to use the full path to `fasthex`.
+NOTE: If you need `sudo`, you may need to use the full path to `fasthex`, if `fasthex` is in `~/.local/bin`
 
 ## Speed advantages:
   1. mmap path: output formatted in parallel with rayon in 64 MiB chunks.
