@@ -23,7 +23,7 @@ git clone https://github.com/CallMeAlphabet/fasthex
 ```
 3. Compile, put into `~/.local/bin`
 ```bash
-cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/fasthex
+cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/fasthex && cd ~
 ```
 4. Clean up
 ```bash
