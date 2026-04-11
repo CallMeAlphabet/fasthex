@@ -53,7 +53,8 @@ time fasthex ~/path/to/file > /dev/null
 
 # Put into RAM (slow SSDs / HDDs can bottleneck a lot)
 sudo mkdir -p /mnt/ramdisk
-sudo mount -t tmpfs -o size=[MAKE SURE YOUR FILE FITS] tmpfs /mnt/ramdisk                         cp ~/path/to/file /mnt/ramdisk/
+sudo mount -t tmpfs -o size=[MAKE SURE YOUR FILE FITS] tmpfs /mnt/ramdisk
+cp ~/path/to/file /mnt/ramdisk
 time fasthex /mnt/ramdisk/file > /dev/null
 ```
 NOTE: If you need `sudo`, you may need to use the full path to `fasthex`, if `fasthex` is in `~/.local/bin`
