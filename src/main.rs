@@ -1015,24 +1015,6 @@ fn run_parallel_mmap(
         }
 
         send_data.send(chunk_out).unwrap();
-
-        // Release mmap pages for the chunk we just finished formatting.
-        // Without this the kernel keeps the entire file resident, which
-        // balloons RSS to the full file size (e.g. 15+ GiB for a 1.5 GiB
-        // file when output expansion is accounted for). MADV_DONTNEED lets
-        // the kernel reclaim those physical pages immediately, keeping
-        // steady-state RSS bounded to a few chunks instead of the whole file.
-        #[cfg(unix)]
-        unsafe {
-            let chunk_start = row_cursor * bpr;
-            let chunk_len = rows * bpr;
-            libc::madvise(
-                data.as_ptr().add(chunk_start) as *mut libc::c_void,
-                chunk_len,
-                libc::MADV_DONTNEED,
-            );
-        }
-
         row_cursor += rows;
     }
 
@@ -1060,9 +1042,6 @@ fn run_serial_mmap(
     let file_size = data.len();
     let full_rows = file_size / bpr;
     let tail_len = file_size % bpr;
-
-    // Release mmap pages every this many rows (matches the 64 MiB parallel chunk size).
-    let dontneed_interval = (64 * 1024 * 1024) / bpr;
 
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(WRITE_BUF, stdout.lock());
@@ -1094,21 +1073,6 @@ fn run_serial_mmap(
         } else {
             format_row_dispatch(opts.mode, opts.no_ascii, &mut row_buf, row_data, off);
             out.write_all(&row_buf)?;
-        }
-
-        // Periodically release pages we've already consumed so the kernel
-        // can reclaim them instead of keeping the whole file in RAM.
-        if r > 0 && r % dontneed_interval == 0 {
-            #[cfg(unix)]
-            unsafe {
-                let chunk_start = (r + 1).saturating_sub(dontneed_interval) * bpr;
-                let chunk_len = dontneed_interval * bpr;
-                libc::madvise(
-                    data.as_ptr().add(chunk_start) as *mut libc::c_void,
-                    chunk_len,
-                    libc::MADV_DONTNEED,
-                );
-            }
         }
     }
 
@@ -1305,4 +1269,4 @@ fn run_streaming(
     }
 
     out.flush()
-}
+        }
