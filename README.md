@@ -26,23 +26,13 @@ fasthex – a very fast hex dumper (written in Rust), with all features that oth
 ## How to set it up
 
 1. Install `cargo` (and optionally `time`)
-2. Clone this repo (It'll put everything into `~/fasthex` automatically)
+2. Install fasthex
 ```bash
-git clone https://github.com/CallMeAlphabet/fasthex
+cargo install --git https://github.com/CallMeAlphabet/fasthex
+# Make sure ~/.cargo/bin is in your PATH!
 ```
-3. Compile, put into `~/.local/bin`
-```bash
-cd ~/fasthex && cargo build --release && cp ~/fasthex/target/release/fasthex ~/.local/bin/ && cd ~
-```
-Or, if `~/.local/bin` isn't in PATH and you don't want to put `~/.local/bin` in PATH
-```bash
-cp ~/fasthex/target/release/fasthex /usr/bin && cd ~
-```
-4. Clean up
-```bash
-rm -rf ~/fasthex
-```
-5. Test it
+
+3. Test it
 ```bash
 # Get help:
 fasthex -h
@@ -59,7 +49,7 @@ sudo mount -t tmpfs -o size=[MAKE SURE YOUR FILE FITS] tmpfs /mnt/ramdisk
 cp ~/path/to/file /mnt/ramdisk
 time fasthex /mnt/ramdisk/file > /dev/null
 ```
-NOTE: If you need `sudo`, you may need to use the full path to `fasthex`, if `fasthex` is in `~/.local/bin`
+NOTE: If you need `sudo`, you may need to use the full path to `fasthex`.
 
 ## Speed advantages:
   1. mmap path: output formatted in parallel with rayon in 64 MiB chunks.
@@ -126,5 +116,5 @@ Arguments:
 
 - All tests were performed on a system with an i5-7500T, 16GB DDR4 RAM, a Samsung 990 Pro NVMe SSD
 - The system has `iommu.passthrough` set to `0` and `iommu.strict` set to `1`, so you may get better performance on the same hardware
-- Each test was followed by a reboot before running the next tool
 - No additional unmentioned flags were used
+- Everything was redirected to /dev/null
