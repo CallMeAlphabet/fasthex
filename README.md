@@ -1,25 +1,27 @@
 # fasthex
 
-fasthex – a very fast hex dumper (written in Rust), with all features that other hexdumpers have too
+fasthex – a very fast hex dumper (written in Rust), with all features that other hexdumpers have too.
 
-## Benchmarks (780 MiB file)
+## Benchmarks (1.5GiB MiB file)
 
 | Tool | Time | Speed vs fasthex |
 |------|------|------------------|
-| **fasthex** | **0.57s** | **1x (baseline)** |
-| xxd | 16.84s | 30x slower |
-| hexyl | 40.34s | 71x slower |
-| hexdump | 53.67s | 95x slower |
+| **fasthex** | **0.78s** | **1x (baseline)** |
+| xxd | 43.62s | 55.5x slower |
+| hexyl¹ | 53.14s | 67.6x slower |
+| hexyl | 104.93s | 133.5x slower |
+| hexdump | 116.03s | 147.5x slower |
+
+**¹ *--color=never was used to avoid colors.***
 
 ## Benchmark 2 (69GiB file)
 
 | Tool | Time |
 |------|------|
 | fasthex | ~1m |
-| hexyl | ~1h 30m |
+| hexyl¹ | ~1h 30m |
 
-*Tested on i5-7500T with file not being in ramdisk and redirected to /dev/null.*
-*All commands were executed without any additional flags.*
+*More info about hardware and testing conditions at the bottom of this README.md.*
 
 ## How to set it up
 
@@ -92,6 +94,8 @@ Standard row layout – 76 bytes:
 NOTE: the offset field is u32, so files larger than 4 GiB will have a
 wrapping offset display. Known limitation.
 
+## Help message
+
 ```bash
 ◄ 0s ◎ fasthex -h                                                                                                                                                       
 Usage:
@@ -116,5 +120,11 @@ Options:
 Arguments:
  Values for <length> and <offset> may be followed by a suffix: KiB, MiB,
  GiB, TiB, PiB, EiB, ZiB, or YiB (where the "iB" is optional).
-                                                                                                                                                                               
-◄ 0s ◎ echo "This repo is not actively maintained as `fasthex` is fast enough and I have other projects. Maybe some features will be added in the future! And yes, I had to put this into an 'echo "[...]"', because I couldn't close the code block for some reason. And it looked really weird putting that note into a code block. So I decided that I should echo it. I'm weird."
+```
+
+## Testing conditions
+
+- All tests were performed on a system with an i5-7500T, 16GB DDR4 RAM, a Samsung 990 Pro NVMe SSD
+- The system has `iommu.passthrough` set to `0` and `iommu.strict` set to `1`, so you may get better performance on the same hardware
+- Each test was followed by a reboot before running the next tool
+- No additional unmentioned flags were used
