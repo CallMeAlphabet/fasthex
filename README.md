@@ -19,7 +19,7 @@ fasthex – a very fast hex dumper (written in Rust), with all features that oth
 | Tool | Time |
 |------|------|
 | fasthex | ~1m |
-| hexyl¹ | ~1h 30m |
+| hexyl | ~1h 30m |
 
 *More info about hardware and testing conditions at the bottom of this README.md.*
 
