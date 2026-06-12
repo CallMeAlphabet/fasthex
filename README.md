@@ -2,7 +2,32 @@
 
 fasthex – a very fast hex dumper (written in Rust), with all features that other hexdumpers have too.
 
-## Benchmarks (1.5GiB file)
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Benchmarks](#benchmarks)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Features](#features)
+- [Example Output](#example-output)
+- [How It Works](#how-it-works)
+- [Known Limitations](#known-limitations)
+- [Testing Conditions](#testing-conditions)
+
+## Quick Start
+
+```bash
+# Install
+cargo install --git https://github.com/CallMeAlphabet/fasthex
+# Make sure ~/.cargo/bin is in your PATH!
+
+# Use it!
+fasthex /path/to/file
+```
+
+## Benchmarks
+
+### Benchmark 1: 1.5 GiB file (output to /dev/null)
 
 | Tool | Time | Speed vs fasthex |
 |------|------|------------------|
@@ -14,44 +39,108 @@ fasthex – a very fast hex dumper (written in Rust), with all features that oth
 
 **¹ *--color=never was used to avoid colors.***
 
-## Benchmark 2 (69GiB file)
+### Benchmark 2: 69 GiB file (output to /dev/null)
 
 | Tool | Time |
 |------|------|
 | fasthex | ~1m |
 | hexyl | ~1h 30m |
 
-*More info about hardware and testing conditions at the bottom of this README.md.*
+## Installation
 
-## How to set it up
+### Prerequisites
 
-1. Install `cargo` (and optionally `time`)
-2. Install fasthex
+- Rust and Cargo
+
+### Steps
+
+1. Install fasthex
 ```bash
 cargo install --git https://github.com/CallMeAlphabet/fasthex
-# Make sure ~/.cargo/bin is in your PATH!
 ```
 
-3. Test it
+2. Verify installation
 ```bash
-# Get help:
 fasthex -h
-
-# Normal test
-time fasthex ~/path/to/file
-
-# Pipe it (faster, vmsplice, kernel pipe)
-time fasthex ~/path/to/file > /dev/null
-
-# Put into RAM (slow SSDs / HDDs can bottleneck a lot)
-sudo mkdir -p /mnt/ramdisk
-sudo mount -t tmpfs -o size=[MAKE SURE YOUR FILE FITS] tmpfs /mnt/ramdisk
-cp ~/path/to/file /mnt/ramdisk
-time fasthex /mnt/ramdisk/file > /dev/null
 ```
-NOTE: If you need `sudo`, you may need to use the full path to `fasthex`.
 
-## Speed advantages:
+## Uninstall
+
+```bash
+cargo uninstall fasthex
+```
+
+> **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fasthex` isn't found, add this to your shell config:
+> ```bash
+> export PATH="$HOME/.cargo/bin:$PATH"
+> ```
+
+## Usage
+
+### Basic usage
+
+```bash
+# Display a file
+fasthex /path/to/file
+
+# Pipe it (faster with zero-copy output)
+fasthex /path/to/file > output.txt
+
+# Skip first 1 KiB and read only 512 bytes
+fasthex -s 1KiB -n 512 /path/to/file
+
+# Display with colors
+fasthex -L /path/to/file
+
+# Binary display
+fasthex -a /path/to/file
+```
+
+### Common use cases
+
+```bash
+# Test on RAM disk (avoids SSD/HDD bottleneck)
+sudo mkdir -p /mnt/ramdisk
+sudo mount -t tmpfs -o size=2G tmpfs /mnt/ramdisk
+cp /path/to/file /mnt/ramdisk
+time fasthex /mnt/ramdisk/file > /dev/null
+
+# Measure time with `time`
+time fasthex /path/to/file
+
+# Interactive viewing
+fasthex /path/to/file | less
+```
+
+## Features
+
+### Supported Output Formats
+
+- Hexadecimal (default, `-x`)
+- Octal (`-o`, `-b`)
+- Decimal (`-d`)
+- Character (`-c`, `-X`)
+- Binary (`-a`)
+- Colored output (`-L`)
+
+### Display Options
+
+- ASCII representation (default, disable with `-i`)
+- Line squeezing for identical lines (`-w`)
+- Arbitrary skip/length with size suffixes (`KiB, MiB, GiB, TiB, PiB, EiB, ZiB, YiB`)
+
+## Example Output
+
+```
+❯ fasthex /bin/ls | head
+00000000 7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00  .ELF............
+00000010 03 00 3e 00 01 00 00 00  f0 54 00 00 00 00 00 00  ..>......T......
+00000020 40 00 00 00 00 00 00 00  a8 73 02 00 00 00 00 00  @........s......
+00000030 00 00 00 00 40 00 38 00  0e 00 40 00 1c 00 1b 00  ....@.8...@.....
+00000040 06 00 00 00 04 00 00 00  40 00 00 00 00 00 00 00  ........@.......
+```
+
+## How It Works:
   1. mmap path: output formatted in parallel with rayon in 64 MiB chunks.
   2. AVX2 path: processes 32 bytes (2 rows) per SIMD call; falls back to
      SSE4.1/SSSE3 (16 bytes / 1 row) or scalar.
@@ -68,6 +157,9 @@ NOTE: If you need `sudo`, you may need to use the full path to `fasthex`.
      if splice rejects the stdout fd (e.g. a tty).
   6. Streaming (stdin) path uses a 4 MiB write buffer.
 
+
+### Output Format
+
 Standard row layout – 76 bytes:
 
 ```
@@ -81,13 +173,9 @@ Standard row layout – 76 bytes:
 [75]     '\n'
 ```
 
-NOTE: the offset field is u32, so files larger than 4 GiB will have a
-wrapping offset display. Known limitation.
+### Full Help
 
-## Help message
-
-```bash
-◄ 0s ◎ fasthex -h                                                                                                                                                       
+```
 Usage:
  fasthex [options] <file>.
 
@@ -112,9 +200,14 @@ Arguments:
  GiB, TiB, PiB, EiB, ZiB, or YiB (where the "iB" is optional).
 ```
 
-## Testing conditions
+## Known Limitations
 
-- All tests were performed on a system with an i5-7500T, 16GB DDR4 RAM, a Samsung 990 Pro NVMe SSD
-- The system has `iommu.passthrough` set to `0` and `iommu.strict` set to `1`, so you may get better performance on the same hardware
-- No additional unmentioned flags were used
-- Everything was redirected to /dev/null
+- Offset field is u32: Files larger than 4 GiB will have wrapping offsets (e.g., a 5 GiB file offsets cycle from `0xFFFFFFFF` back to `0x00000000`)
+
+## Testing Conditions
+
+- Hardware: Intel i5-7500T, 16GB DDR4 RAM, Samsung 990 Pro NVMe SSD
+- OS Settings: `iommu.passthrough=0`, `iommu.strict=1` (you may get better results on the same hardware)
+- Output: All tests redirected to `/dev/null`
+- Flags: No additional unmentioned flags were used
+- I use Arch GNU/Linux btw
