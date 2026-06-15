@@ -21,9 +21,16 @@ fasthex – a very fast hex dumper (written in Rust), with all features that oth
 cargo install --git https://github.com/CallMeAlphabet/fasthex
 ```
 
-> **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fasthex` isn't found, add this to your shell config:
+> **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fasthex` isn't found, add this to your shell config file:
 > ```bash
+> # If you use Bash:
 > export PATH="$HOME/.cargo/bin:$PATH"
+>
+> # If you use Fish:
+> fish_add_path $HOME/.cargo/bin
+>
+> # If you use Zsh:
+> export PATH="$PATH:$HOME/.cargo/bin"
 > ```
 
 ```bash
