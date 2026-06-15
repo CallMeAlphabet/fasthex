@@ -6,7 +6,7 @@ fasthex – a very fast hex dumper (written in Rust), with all features that oth
 
 - [Quick Start](#quick-start)
 - [Benchmarks](#benchmarks)
-- [Installation](#installation)
+- [Uninstall](#Uninstall)
 - [Usage](#usage)
 - [Features](#features)
 - [Example Output](#example-output)
@@ -58,24 +58,6 @@ fasthex /path/to/file
 |------|------|
 | fasthex | ~1m |
 | hexyl | ~1h 30m |
-
-## Installation
-
-### Prerequisites
-
-- Rust and Cargo
-
-### Steps
-
-1. Install fasthex
-```bash
-cargo install --git https://github.com/CallMeAlphabet/fasthex
-```
-
-2. Verify installation
-```bash
-fasthex -h
-```
 
 ## Uninstall
 
