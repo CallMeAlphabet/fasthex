@@ -1,6 +1,6 @@
 # fasthex
 
-fasthex – a very fast hex dumper (written in Rust), with all features that other hexdumpers have too.
+fasthex – a very fast hex dumper (written in Rust), with all features that other hex dumpers have too.
 
 ## Table of Contents
 
