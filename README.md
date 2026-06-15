@@ -19,8 +19,14 @@ fasthex – a very fast hex dumper (written in Rust), with all features that oth
 ```bash
 # Install
 cargo install --git https://github.com/CallMeAlphabet/fasthex
-# Make sure ~/.cargo/bin is in your PATH!
+```
 
+> **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fasthex` isn't found, add this to your shell config:
+> ```bash
+> export PATH="$HOME/.cargo/bin:$PATH"
+> ```
+
+```bash
 # Use it!
 fasthex /path/to/file
 ```
@@ -69,11 +75,6 @@ fasthex -h
 ```bash
 cargo uninstall fasthex
 ```
-
-> **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fasthex` isn't found, add this to your shell config:
-> ```bash
-> export PATH="$HOME/.cargo/bin:$PATH"
-> ```
 
 ## Usage
 
