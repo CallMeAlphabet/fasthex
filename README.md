@@ -80,10 +80,10 @@ fasthex /path/to/file > output.txt
 fasthex -s 1KiB -n 512 /path/to/file
 
 # Display with colors
-fasthex -L /path/to/file
+fasthex --color=always /path/to/file
 
 # Binary display
-fasthex -a /path/to/file
+fasthex -b /path/to/file
 ```
 
 ### Common use cases
@@ -106,28 +106,32 @@ fasthex /path/to/file | less
 
 ### Supported Output Formats
 
-- Hexadecimal (default, `-x`)
-- Octal (`-o`, `-b`)
+- Octal (`-o`)
 - Decimal (`-d`)
-- Character (`-c`, `-X`)
-- Binary (`-a`)
-- Colored output (`-L`)
+- Binary (`-b`)
+- Colored output (`--color=always`)
+- ... and more!
 
 ### Display Options
 
-- ASCII representation (default, disable with `-i`)
+- ASCII representation (default, disable with `-A`)
 - Line squeezing for identical lines (`-w`)
 - Arbitrary skip/length with size suffixes (`KiB, MiB, GiB, TiB, PiB, EiB, ZiB, YiB`)
 
 ## Example Output
 
 ```
-❯ fasthex /bin/ls | head
-00000000 7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00  .ELF............
-00000010 03 00 3e 00 01 00 00 00  f0 54 00 00 00 00 00 00  ..>......T......
-00000020 40 00 00 00 00 00 00 00  a8 73 02 00 00 00 00 00  @........s......
-00000030 00 00 00 00 40 00 38 00  0e 00 40 00 1c 00 1b 00  ....@.8...@.....
-00000040 06 00 00 00 04 00 00 00  40 00 00 00 00 00 00 00  ........@.......
+❯ fasthex3 /bin/ls | head
+00000000: 7f 45 4c 46 02 01 01 00  00 00 00 00 00 00 00 00  |.ELF............|
+00000010: 03 00 3e 00 01 00 00 00  f0 54 00 00 00 00 00 00  |..>......T......|
+00000020: 40 00 00 00 00 00 00 00  a8 73 02 00 00 00 00 00  |@........s......|
+00000030: 00 00 00 00 40 00 38 00  0e 00 40 00 1c 00 1b 00  |....@.8...@.....|
+00000040: 06 00 00 00 04 00 00 00  40 00 00 00 00 00 00 00  |........@.......|
+00000050: 40 00 00 00 00 00 00 00  40 00 00 00 00 00 00 00  |@.......@.......|
+00000060: 10 03 00 00 00 00 00 00  10 03 00 00 00 00 00 00  |................|
+00000070: 08 00 00 00 00 00 00 00  03 00 00 00 04 00 00 00  |................|
+00000080: 74 03 00 00 00 00 00 00  74 03 00 00 00 00 00 00  |t.......t.......|
+00000090: 74 03 00 00 00 00 00 00  1c 00 00 00 00 00 00 00  |t...............|
 ```
 
 ## How It Works:
@@ -148,51 +152,71 @@ fasthex /path/to/file | less
   6. Streaming (stdin) path uses a 4 MiB write buffer.
 
 
-### Output Format
-
-Standard row layout – 76 bytes:
-
-```
-[0..7]   8-digit hex offset
-[8]      ' '
-[9..32]  hex group-1  (8 bytes × "XX ")
-[33]     extra gap space
-[34..57] hex group-2  (8 bytes × "XX ")
-[58]     ' '
-[59..74] ASCII printable / '.'
-[75]     '\n'
-```
-
 ### Full Help
 
 ```
+fasthex 0.3.0 - a very fast hex dumper
+
 Usage:
- fasthex [options] <file>.
+  fasthex [options] [file]...
+  fasthex -r [options] [file] [-j <offset>]
+  fasthex [options] -          read from stdin explicitly
 
-Options:
- -b, --one-byte-octal      one-byte octal display
- -X, --one-byte-hex        one-byte hexadecimal display
- -c, --one-byte-char       one-byte character display
- -d, --two-bytes-decimal   two-byte decimal display
- -o, --two-bytes-octal     two-byte octal display
- -x, --two-bytes-hex       two-byte hexadecimal display
- -L, --color[=<hexValue>]  color the output
- -n, --length <length>     interpret only length bytes of input
- -s, --skip <offset>       skip offset bytes from the beginning
- -w, --with-squeezing      do not output identical lines
- -i, --no-ascii            do not display ascii
- -a, --binary              binary display
- -v, --version             display version (always outputs 2.0)
- -h, --help                display this help page
+Multiple files are concatenated and treated as one stream.
+If no file is given, reads from stdin.
 
-Arguments:
- Values for <length> and <offset> may be followed by a suffix: KiB, MiB,
- GiB, TiB, PiB, EiB, ZiB, or YiB (where the "iB" is optional).
+OUTPUT FORMAT
+  Rule: lowercase = one-byte mode, UPPERCASE = two-byte mode.
+
+      (default)               canonical hex + ASCII display
+  -x, --hex                   one-byte hexadecimal display
+  -X, --hex-wide              two-byte hexadecimal display
+  -o, --octal                 one-byte octal display
+  -O, --octal-wide            two-byte octal display
+  -d, --decimal               one-byte decimal display
+  -D, --decimal-wide          two-byte decimal display
+  -c, --chars                 one-byte character display
+  -b, --binary                binary display (8 bits per byte)
+  -p, --plain                 plain hex string, no offset or ASCII
+  -i, --include               C include file style output
+  -r, --reverse               convert hex dump back to binary
+
+LAYOUT
+  -W, --width <N>             bytes per row (default: 16)
+  -g, --group <N>             bytes per group: 1, 2, 4, 8
+  -E, --endian <MODE>         big | little  (default: big)
+  -B, --border <STYLE>        none | ascii | unicode  (default: none)
+  -A, --no-ascii              hide the ASCII panel
+  -P, --no-position           hide the offset/position column
+
+OFFSET & NAVIGATION
+  -s, --skip <N>              skip first N bytes (negative = from end)
+  -n, --length <N>            read only N bytes
+  -j, --jump <N>              bias added to every displayed offset
+  -u, --uppercase             uppercase hex digits (A-F)
+      --offset-dec            show offsets in decimal
+
+COLOR
+  -L, --color <WHEN>          auto | always | never  (default: auto)
+  -S, --scheme <NAME>         default | type | gradient
+  -T, --table <MODE>          ascii | default | braille | cp437 | ebcdic
+
+FILTERING & FLOW
+  -w, --squeeze               replace identical rows with '*'
+  -m, --max-lines <N>         stop after N output lines
+  -q, --quiet                 suppress warnings
+
+CUSTOM FORMAT
+  -F, --format <FMT>          hexdump -e style format string
+  -f, --format-file <FILE>    read format strings from file
+
+MISC
+  -h, --help                  show this help
+  -v, --version               show version
+
+SIZE SUFFIXES: KiB/K/MiB/M/GiB/G/TiB/T/PiB/P/EiB/E  kB/MB/GB/TB/PB/EB  0x…
 ```
 
-## Known Limitations
-
-- Offset field is u32: Files larger than 4 GiB will have wrapping offsets (e.g., a 5 GiB file offsets cycle from `0xFFFFFFFF` back to `0x00000000`)
 
 ## Testing Conditions
 
