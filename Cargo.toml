@@ -1,16 +1,12 @@
 [package]
 name = "fasthex"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
 memmap2 = "0.9"
-rayon   = "1.10"
-libc    = "0.2"
-
-[[bin]]
-name = "fasthex"
-path = "src/main.rs"
+rayon = "1.10"
+libc = "0.2"
 
 [profile.release]
 opt-level       = 3
