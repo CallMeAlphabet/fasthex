@@ -11,7 +11,6 @@ fasthex — a very fast hex dumper (written in Rust), with all features that oth
 - [Features](#features)
 - [Example Output](#example-output)
 - [How It Works](#how-it-works)
-- [Known Limitations](#known-limitations)
 - [Testing Conditions](#testing-conditions)
 
 ## Quick Start
