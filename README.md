@@ -219,8 +219,4 @@ SIZE SUFFIXES: KiB/K/MiB/M/GiB/G/TiB/T/PiB/P/EiB/E  kB/MB/GB/TB/PB/EB  0x…
 
 ## Testing Conditions
 
-- Hardware: Intel i5-7500T, 16GB DDR4 RAM, Samsung 990 Pro NVMe SSD
-- OS Settings: `iommu.passthrough=0`, `iommu.strict=1` (you may get better results on the same hardware)
-- Output: All tests redirected to `/dev/null`
-- Flags: No additional unmentioned flags were used
-- I use Arch GNU/Linux btw
+https://gist.github.com/CallMeAlphabet/4b7022c4b1a8849e6943526de6a23582
