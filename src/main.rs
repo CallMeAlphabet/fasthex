@@ -15,6 +15,7 @@
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::too_many_arguments)]
 
+use clihelp::{HelpPage, Row, Section};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::arch::x86_64::*;
@@ -170,63 +171,8 @@ impl Default for Options {
     }
 }
 
-const BOLD_GREEN: &str = "\x1b[1;32m";
-const BOLD_CYAN: &str = "\x1b[1;36m";
-const CYAN: &str = "\x1b[36m";
-const RESET: &str = "\x1b[0m";
-
-const DESC_COLUMN: usize = 28;
-
-fn paint(color: &str, s: &str, on: bool) -> String {
-    if on {
-        format!("{color}{s}{RESET}")
-    } else {
-        s.to_string()
-    }
-}
-
-struct Row {
-    short: &'static str,
-    long: &'static str,
-    placeholder: Option<&'static str>,
-    desc: &'static str,
-}
-
-impl Row {
-    fn plain_flags(&self) -> String {
-        let base = if self.short.is_empty() {
-            format!("    {}", self.long)
-        } else {
-            format!("{}, {}", self.short, self.long)
-        };
-        match self.placeholder {
-            Some(ph) => format!("{base} {ph}"),
-            None => base,
-        }
-    }
-
-    fn styled_flags(&self, on: bool) -> String {
-        let lit = |s: &str| paint(BOLD_CYAN, s, on);
-        let base = if self.short.is_empty() {
-            format!("    {}", lit(self.long))
-        } else {
-            format!("{}, {}", lit(self.short), lit(self.long))
-        };
-        match self.placeholder {
-            Some(ph) => format!("{base} {}", paint(CYAN, ph, on)),
-            None => base,
-        }
-    }
-
-    fn render(&self, on: bool) -> String {
-        let plain_len = self.plain_flags().len();
-        let pad = DESC_COLUMN.saturating_sub(plain_len);
-        format!("  {}{}{}", self.styled_flags(on), " ".repeat(pad), self.desc)
-    }
-}
-
 fn row(short: &'static str, long: &'static str, desc: &'static str) -> Row {
-    Row { short, long, placeholder: None, desc }
+    Row::new(short, long, desc)
 }
 fn row_val(
     short: &'static str,
@@ -234,13 +180,7 @@ fn row_val(
     placeholder: &'static str,
     desc: &'static str,
 ) -> Row {
-    Row { short, long, placeholder: Some(placeholder), desc }
-}
-
-struct Section {
-    title: &'static str,
-    note: Option<&'static str>,
-    rows: Vec<Row>,
+    Row::with_value(short, long, placeholder, desc)
 }
 
 fn output_format_rows() -> Vec<Row> {
@@ -332,37 +272,21 @@ fn print_help() {
 }
 
 pub fn print_help_body(on: bool) {
-    let header = |s: &str| paint(BOLD_GREEN, s, on);
-
-    let mut out = String::new();
-
-    out.push_str("fasthex 0.3.0 - a very fast hex dumper\n\n");
-
-    out.push_str(&format!("{}\n", header("Usage:")));
-    out.push_str("  fasthex [options] [file]...\n");
-    out.push_str("  fasthex -r [options] [file] [-j <offset>]\n");
-    out.push_str("  fasthex [options] -          read from stdin explicitly\n\n");
-
-    out.push_str(
-        "Multiple files are concatenated and treated as one stream.\n\
-         If no file is given, reads from stdin.\n\n",
-    );
+    let mut page = HelpPage::new("fasthex 0.3.0 - a very fast hex dumper")
+        .usage("fasthex [options] [file]...")
+        .usage("fasthex -r [options] [file] [-j <offset>]")
+        .usage("fasthex [options] -          read from stdin explicitly")
+        .blurb(
+            "Multiple files are concatenated and treated as one stream.\n\
+             If no file is given, reads from stdin.",
+        )
+        .footer("SIZE SUFFIXES: KiB/K/MiB/M/GiB/G/TiB/T/PiB/P/EiB/E  kB/MB/GB/TB/PB/EB  0x…");
 
     for section in sections() {
-        out.push_str(&format!("{}\n", header(section.title)));
-        if let Some(note) = section.note {
-            out.push_str(&format!("  {note}\n\n"));
-        }
-        for r in &section.rows {
-            out.push_str(&r.render(on));
-            out.push('\n');
-        }
-        out.push('\n');
+        page = page.section(section);
     }
 
-    out.push_str("SIZE SUFFIXES: KiB/K/MiB/M/GiB/G/TiB/T/PiB/P/EiB/E  kB/MB/GB/TB/PB/EB  0x…\n");
-
-    print!("{out}");
+    print!("{}", page.render(on));
 }
 
 fn parse_size_signed(s: &str) -> Result<i64, String> {
