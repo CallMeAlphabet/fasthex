@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        run: |
+          BIN_NAME=$(grep '^name' Cargo.toml | head -1 | cut -d'"' -f2)
+          TAG=${GITHUB_REF#refs/tags/}
+          mkdir -p dist
+          cp target/release/$BIN_NAME dist/
+          cp README.md LICENSE dist/
+          tar -C dist -czf "${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz" .
+          sha256sum "${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz" > "${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.tar.gz.sha256
+          generate_release_notes: true
