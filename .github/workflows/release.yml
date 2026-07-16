@@ -26,23 +26,19 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binary
+- name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package tarball
+      - name: Prepare binary
         run: |
           BIN_NAME=$(grep '^name' Cargo.toml | head -1 | cut -d'"' -f2)
-          TAG=${GITHUB_REF#refs/tags/}
-          mkdir -p dist
-          cp target/release/$BIN_NAME dist/
-          cp README.md LICENSE dist/
-          tar -C dist -czf "${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz" .
-          sha256sum "${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz" > "${BIN_NAME}-${TAG}-x86_64-unknown-linux-gnu.tar.gz.sha256"
+          cp "target/release/$BIN_NAME" "./$BIN_NAME"
+          sha256sum "$BIN_NAME" > "$BIN_NAME.sha256"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            *.tar.gz
-            *.tar.gz.sha256
+            fasthex
+            fasthex.sha256
           generate_release_notes: true
