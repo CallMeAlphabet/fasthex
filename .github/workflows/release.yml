@@ -2,8 +2,13 @@ name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.*'
+      - '.*/**'
 
 permissions:
   contents: write
@@ -31,14 +36,20 @@ jobs:
 
       - name: Prepare binary
         run: |
-          BIN_NAME=$(grep '^name' Cargo.toml | head -1 | cut -d'"' -f2)
-          cp "target/release/$BIN_NAME" "./$BIN_NAME"
-          sha256sum "$BIN_NAME" > "$BIN_NAME.sha256"
+          cp target/release/fasthex ./fasthex
+          sha256sum fasthex > fasthex.sha256
 
-      - name: Create GitHub Release
+      - name: Move rolling tag
+        run: |
+          git tag -f latest
+          git push origin latest --force
+
+      - name: Create/update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: latest
+          name: Latest build
+          make_latest: true
           files: |
             fasthex
             fasthex.sha256
-          generate_release_notes: true
