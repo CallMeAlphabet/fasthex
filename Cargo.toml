@@ -1,6 +1,9 @@
 [package]
 name = "fasthex"
 version = "0.3.0"
+description = "a very fast hex dumper"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/CallMeAlphabet/fasthex"
 edition = "2021"
 
 [dependencies]
