@@ -14,12 +14,15 @@ fasthex — a very fast hex dumper (written in Rust), with all features that oth
 - [Testing Conditions](#testing-conditions)
 
 ## Quick Start
-
+- **On Arch**
 ```bash
-# Install
-cargo install --git https://github.com/CallMeAlphabet/fasthex
+paru -S fasthex 
+# or fasthex-bin for a prebuilt release
 ```
-
+- **Non-arch**
+```bash
+cargo install fasthex
+```
 > **Note**: Make sure `~/.cargo/bin` is in your `PATH`. It's added automatically by rustup, but if `fasthex` isn't found, add this to your shell config file:
 > ```bash
 > # If you use Bash:
