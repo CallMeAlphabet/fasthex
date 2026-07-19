@@ -42,6 +42,7 @@ jobs:
 
           useradd -m builduser
           chown -R builduser:builduser /tmp/aur-repo
+          git config --global --add safe.directory /tmp/aur-repo
           su builduser -c "cd /tmp/aur-repo && makepkg --printsrcinfo > .SRCINFO"
 
           git config user.name "CallMeAlphabet"
