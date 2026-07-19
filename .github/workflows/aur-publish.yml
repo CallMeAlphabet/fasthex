@@ -18,47 +18,33 @@ jobs:
       - name: Install tools
         run: pacman -Sy --noconfirm base-devel git openssh
 
-      - uses: actions/checkout@v4
-
-      - name: Set up SSH for AUR
+      - name: Set up SSH, clone, bump version, and push to AUR
         run: |
+          set -e
           mkdir -p /tmp/ssh
           echo "$AUR_SSH_PRIVATE_KEY" > /tmp/ssh/aur_key
           chmod 600 /tmp/ssh/aur_key
-          echo "GIT_SSH_COMMAND=ssh -i /tmp/ssh/aur_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" >> $GITHUB_ENV
-        env:
-          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          export GIT_SSH_COMMAND="ssh -i /tmp/ssh/aur_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
-      - name: Debug key structure (no sensitive content printed)
-        run: |
-          echo "Line count: $(wc -l < /tmp/ssh/aur_key)"
-          echo "First line: $(head -1 /tmp/ssh/aur_key)"
-          echo "Last line: $(tail -1 /tmp/ssh/aur_key)"
-          ssh-keygen -l -f /tmp/ssh/aur_key || echo "ssh-keygen could not read this as a valid key"
+          git clone ssh://aur@aur.archlinux.org/fasthex.git /tmp/aur-repo
+          cd /tmp/aur-repo
 
-      - name: Test SSH auth directly (no repo clone yet)
-        run: |
-          ssh -i /tmp/ssh/aur_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -T aur@aur.archlinux.org || true
-
-      - name: Clone AUR repo
-        run: git clone ssh://aur@aur.archlinux.org/fasthex.git aur-repo
-
-      - name: Bump version and regenerate metadata
-        run: |
           NEW_VERSION=$GITHUB_RUN_NUMBER
-          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" aur-repo/PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" aur-repo/PKGBUILD
-          useradd -m builduser
-          chown -R builduser:builduser aur-repo
-          cd aur-repo
-          su builduser -c "makepkg --printsrcinfo" > .SRCINFO
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
 
-      - name: Commit and push to AUR
-        run: |
-          cd aur-repo
+          useradd -m builduser
+          chown -R builduser:builduser /tmp/aur-repo
+          su builduser -c "cd /tmp/aur-repo && makepkg --printsrcinfo > .SRCINFO"
+
           git config user.name "CallMeAlphabet"
           git config user.email "sigma.alphabet@proton.me"
           git add PKGBUILD .SRCINFO
-          git diff --cached --quiet && echo "No changes" && exit 0
-          git commit -m "Auto-bump to build $GITHUB_RUN_NUMBER"
-          git push
+          if git diff --cached --quiet; then
+            echo "No changes to push"
+          else
+            git commit -m "Auto-bump to build $GITHUB_RUN_NUMBER"
+            git push
+          fi
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
