@@ -1,0 +1,56 @@
+name: aur-publish
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.*'
+      - '.*/**'
+
+jobs:
+  aur-publish:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install tools
+        run: pacman -Sy --noconfirm base-devel git openssh
+
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH for AUR
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          echo "Host aur.archlinux.org" >> ~/.ssh/config
+          echo "  IdentityFile ~/.ssh/aur" >> ~/.ssh/config
+          echo "  User aur" >> ~/.ssh/config
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Clone AUR repo
+        run: git clone ssh://aur@aur.archlinux.org/fasthex.git aur-repo
+
+      - name: Bump version and regenerate metadata
+        run: |
+          NEW_VERSION=$GITHUB_RUN_NUMBER
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" aur-repo/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" aur-repo/PKGBUILD
+          cd aur-repo
+          useradd -m builduser
+          chown -R builduser:builduser /__w
+          su builduser -c "makepkg --printsrcinfo" > .SRCINFO
+
+      - name: Commit and push to AUR
+        run: |
+          cd aur-repo
+          git config user.name "CallMeAlphabet"
+          git config user.email "sigma.alphabet@proton.me"
+          git add PKGBUILD .SRCINFO
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "Auto-bump to build $GITHUB_RUN_NUMBER"
+          git push
