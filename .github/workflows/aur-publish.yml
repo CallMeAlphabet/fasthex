@@ -27,6 +27,13 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i /tmp/ssh/aur_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
           git clone ssh://aur@aur.archlinux.org/fasthex.git /tmp/aur-repo
+
+          echo "=== Diagnostic: checking clone result ==="
+          ls -la /tmp/aur-repo
+          echo "=== git status ==="
+          git -C /tmp/aur-repo status
+          echo "=== end diagnostic ==="
+
           cd /tmp/aur-repo
 
           NEW_VERSION=$GITHUB_RUN_NUMBER
