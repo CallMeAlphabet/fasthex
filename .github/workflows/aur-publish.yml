@@ -29,6 +29,17 @@ jobs:
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
 
+      - name: Debug key structure (no sensitive content printed)
+        run: |
+          echo "Line count: $(wc -l < /tmp/ssh/aur_key)"
+          echo "First line: $(head -1 /tmp/ssh/aur_key)"
+          echo "Last line: $(tail -1 /tmp/ssh/aur_key)"
+          ssh-keygen -l -f /tmp/ssh/aur_key || echo "ssh-keygen could not read this as a valid key"
+
+      - name: Test SSH auth directly (no repo clone yet)
+        run: |
+          ssh -i /tmp/ssh/aur_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -T aur@aur.archlinux.org || true
+
       - name: Clone AUR repo
         run: git clone ssh://aur@aur.archlinux.org/fasthex.git aur-repo
 
