@@ -1,4 +1,4 @@
-//! fasthex 0.3.0 – a very fast hex dumper
+//! fasthex 0.3.1 – a very fast hex dumper
 //!
 //! Speed notes:
 //!   1. mmap + rayon parallel formatting in 64 MiB chunks.
@@ -19,13 +19,15 @@ use clihelp::{HelpPage, Row, Section};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::arch::x86_64::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::env;
 use std::fs::File;
 use std::io::{self, BufWriter, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::sync::mpsc::{channel, sync_channel};
 use std::thread;
 
-const READ_BUF: usize = 256 * 1024;
+const READ_BUF: usize = 4 * 1024 * 1024;
 const WRITE_BUF: usize = 4 * 1024 * 1024;
 const PIPE_SIZE_HINT: libc::c_int = 2 * 1024 * 1024;
 const _CHUNK_ROWS: usize = (64 * 1024 * 1024) / 76; // recalculated per-mode at runtime
@@ -114,6 +116,7 @@ enum CharTable { Ascii, Default, Braille, Cp437, Ebcdic }
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Endian { Big, Little }
 
+#[derive(Clone)]
 struct Options {
     mode:         DisplayMode,
     width:        usize,        // bytes per row (0 = auto for unicode border)
@@ -272,7 +275,7 @@ fn print_help() {
 }
 
 pub fn print_help_body(on: bool) {
-    let mut page = HelpPage::new("fasthex 0.3.0 - a very fast hex dumper")
+    let mut page = HelpPage::new("fasthex 0.3.1 - a very fast hex dumper")
         .usage("fasthex [options] [file]...")
         .usage("fasthex -r [options] [file] [-j <offset>]")
         .usage("fasthex [options] -          read from stdin explicitly")
@@ -354,7 +357,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
 
             match key {
                 "help"    => { print_help(); std::process::exit(0); }
-                "version" => { println!("0.3.0"); std::process::exit(0); }
+                "version" => { println!("0.3.1"); std::process::exit(0); }
                 "hex"           => opts.mode = DisplayMode::OneByteHex,
                 "hex-wide"      => opts.mode = DisplayMode::TwoByteHex,
                 "octal"         => opts.mode = DisplayMode::OneByteOctal,
@@ -453,7 +456,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
             while j < bytes.len() {
                 match bytes[j] {
                     b'h' => { print_help(); std::process::exit(0); }
-                    b'v' => { println!("0.3.0"); std::process::exit(0); }
+                    b'v' => { println!("0.3.1"); std::process::exit(0); }
                     b'x' => opts.mode = DisplayMode::OneByteHex,
                     b'X' => opts.mode = DisplayMode::TwoByteHex,
                     b'o' => opts.mode = DisplayMode::OneByteOctal,
@@ -645,13 +648,6 @@ fn write_offset(dst: &mut [u8], off: u64, dec: bool, upper: bool) -> usize {
     }
 }
 
-#[inline(always)]
-unsafe fn write_offset_n(dst: *mut u8, off: u64, n: usize) {
-    for k in 0..n {
-        *dst.add(n - 1 - k) = HEX_LOWER[((off >> (k * 4)) & 0xf) as usize];
-    }
-}
-
 fn _char_for_byte(b: u8, table: CharTable) -> &'static str {
     match table {
         CharTable::Ascii => {
@@ -728,43 +724,68 @@ impl ZeroCopyWriter {
     }
 
     unsafe fn write_zero_copy(&mut self, buf: &[u8]) -> io::Result<()> {
-        let mut vsrc = buf.as_ptr();
-        let mut vremain = buf.len();
-        while vremain > 0 {
-            let iov = libc::iovec { iov_base: vsrc as *mut _, iov_len: vremain };
-            let vspliced = libc::vmsplice(self.pipe_w, &iov, 1, libc::SPLICE_F_GIFT);
-            if vspliced < 0 { self.drain_pipe_fallback(buf)?; return Ok(()); }
-            let vspliced = vspliced as usize;
-            vsrc = vsrc.add(vspliced);
-            vremain -= vspliced;
-            let mut sremain = vspliced;
-            while sremain > 0 {
-                let n = libc::splice(self.pipe_r, std::ptr::null_mut(),
-                                     self.stdout, std::ptr::null_mut(),
-                                     sremain, libc::SPLICE_F_MOVE);
-                if n < 0 {
-                    let e = io::Error::last_os_error();
-                    if e.raw_os_error() == Some(libc::EINVAL) {
-                        self.drain_pipe_fallback(buf)?;
-                        return Ok(());
-                    }
-                    return Err(e);
+        let mut pos = 0usize;
+        while pos < buf.len() {
+            let iov = libc::iovec {
+                iov_base: buf.as_ptr().add(pos) as *mut libc::c_void,
+                iov_len:  buf.len() - pos,
+            };
+            let n = libc::vmsplice(self.pipe_w, &iov, 1, libc::SPLICE_F_GIFT);
+            if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINVAL) || e.raw_os_error() == Some(libc::ENOSYS) {
+                    return self.fallback_write(&buf[pos..]);
                 }
-                sremain -= n as usize;
+                return Err(e);
+            }
+            if n == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "vmsplice returned 0"));
+            }
+            let n = n as usize;
+            pos += n;
+            if let Err(e) = self.splice_out(n) {
+                if e.raw_os_error() == Some(libc::EINVAL) {
+                    return self.fallback_write(&buf[pos..]);
+                }
+                return Err(e);
             }
         }
         Ok(())
     }
 
-    fn drain_pipe_fallback(&mut self, full: &[u8]) -> io::Result<()> {
+    unsafe fn splice_out(&mut self, len: usize) -> io::Result<()> {
+        let mut remain = len;
+        while remain > 0 {
+            let n = libc::splice(self.pipe_r, std::ptr::null_mut(),
+                                 self.stdout, std::ptr::null_mut(),
+                                 remain, libc::SPLICE_F_MOVE);
+            if n < 0 { return Err(io::Error::last_os_error()); }
+            if n == 0 { return Err(io::Error::new(io::ErrorKind::BrokenPipe, "splice ended early")); }
+            remain -= n as usize;
+        }
+        Ok(())
+    }
+
+    fn fallback_write(&mut self, remainder: &[u8]) -> io::Result<()> {
         self.fallback = true;
+        let fl = unsafe { libc::fcntl(self.pipe_r, libc::F_GETFL) };
+        if fl >= 0 {
+            unsafe { libc::fcntl(self.pipe_r, libc::F_SETFL, fl | libc::O_NONBLOCK); }
+        }
         let mut tmp = vec![0u8; 65536];
         loop {
-            let n = unsafe { libc::read(self.pipe_r, tmp.as_mut_ptr() as *mut _, tmp.len()) };
-            if n <= 0 { break; }
-            io::stdout().lock().write_all(&tmp[..n as usize])?;
+            let n = unsafe { libc::read(self.pipe_r, tmp.as_mut_ptr() as *mut libc::c_void, tmp.len()) };
+            if n > 0 {
+                io::stdout().lock().write_all(&tmp[..n as usize])?;
+            } else if n < 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(libc::EINTR) { continue; }
+                break;
+            } else {
+                break;
+            }
         }
-        self.write_fallback(full)
+        self.write_fallback(remainder)
     }
 
     fn write_fallback(&self, buf: &[u8]) -> io::Result<()> {
@@ -778,105 +799,892 @@ impl Drop for ZeroCopyWriter {
     }
 }
 
-macro_rules! expand_and_store {
-    ($dst:expr, $pairs_lo:expr, $pairs_hi:expr, $ascii:expr) => {{
-        let p = $dst;
-        let spaces = _mm_set1_epi8(b' ' as i8);
-        let zero   = _mm_setzero_si128();
-        let shuf_a = _mm_setr_epi8(0,1,-1,2,3,-1,4,5,-1,6,7,-1,-1,-1,-1,-1);
-        let shuf_b = _mm_setr_epi8(8,9,-1,10,11,-1,12,13,-1,14,15,-1,-1,-1,-1,-1);
-        macro_rules! expand {
-            ($pairs:expr, $shuf:expr) => {{
-                let c = _mm_shuffle_epi8($pairs, $shuf);
-                _mm_blendv_epi8(c, spaces, _mm_cmpeq_epi8(c, zero))
-            }};
+struct HexWin {
+    off: usize,
+    idx: [i8; 16],
+    sp:  [u8; 16],
+}
+
+struct ConstBlock {
+    off: usize,
+    len: u8,
+    val: u64,
+}
+
+struct CanonKernel {
+    idx_a:  [[i8; 16]; 3],
+    idx_b:  [[i8; 16]; 3],
+    sp:     [[u8; 16]; 3],
+    t0_idx: [i8; 16],
+    t0_sp:  [u8; 16],
+    t1_idx: [i8; 16],
+    t1_sp:  [u8; 16],
+    tail:   (usize, u16),
+}
+
+struct RowLayout {
+    emitted:       usize,
+    windows:       Vec<HexWin>,
+    ascii_windows: Vec<HexWin>,
+    ascii_off:     usize,
+    ascii_run:     usize,
+    esc_mask:      Option<[u8; 16]>,
+    consts:        Vec<ConstBlock>,
+    all_fit:       bool,
+    fast:          Option<CanonKernel>,
+}
+
+#[inline(always)]
+unsafe fn store_block(dst: *mut u8, b: &ConstBlock) {
+    match b.len {
+        1 => *dst.add(b.off) = b.val as u8,
+        2 => *(dst.add(b.off) as *mut u16) = b.val as u16,
+        4 => *(dst.add(b.off) as *mut u32) = b.val as u32,
+        _ => *(dst.add(b.off) as *mut u64) = b.val,
+    }
+}
+
+struct RowCore {
+    opts:                 Options,
+    width:                usize,
+    blocks:               usize,
+    fixed_prefix:         bool,
+    prefix_fixed:         usize,
+    pos_w:                usize,
+    bar:                  [u8; 3],
+    bar_len:              usize,
+    full:                 RowLayout,
+    rev:                  Option<[i8; 16]>,
+    tail_kind:            LayoutKind,
+}
+
+struct RowCfg {
+    core:  RowCore,
+    tails: RefCell<HashMap<usize, RowLayout>>,
+}
+
+fn field_len_for(opts: &Options, off: u64) -> usize {
+    if opts.offset_dec {
+        let mut n = 1u32;
+        let mut x = off;
+        while x >= 10 { x /= 10; n += 1; }
+        (n as usize).max(8)
+    } else {
+        offset_len(off)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LayoutKind { Generic, OutputLine, Scalar }
+
+fn format_scalar_row(dst: &mut Vec<u8>, src: &[u8], off: u64, no_ascii: bool) {
+    let n     = src.len();
+    let width = 16;
+    let half  = width / 2;
+    let mut tmp = [0u8; 20];
+    let olen = write_offset(&mut tmp, off, false, false);
+    dst.extend_from_slice(&tmp[..olen]);
+    dst.push(b':');
+    dst.push(b' ');
+    for i in 0..width {
+        if i > 0 && i % half == 0 { dst.push(b' '); }
+        if i < n {
+            let b = src[i];
+            dst.push(HEX_LOWER[(b >> 4) as usize]);
+            dst.push(HEX_LOWER[(b & 0xf) as usize]);
+            if i < width - 1 || !no_ascii { dst.push(b' '); }
+        } else {
+            dst.push(b' ');
+            dst.push(b' ');
+            if i < width - 1 || !no_ascii { dst.push(b' '); }
         }
-        let c1 = expand!($pairs_lo, shuf_a);
-        let c2 = expand!($pairs_lo, shuf_b);
-        let c3 = expand!($pairs_hi, shuf_a);
-        let c4 = expand!($pairs_hi, shuf_b);
-        _mm_storeu_si128(p.add(9)  as *mut __m128i, c1);
-        _mm_storeu_si128(p.add(21) as *mut __m128i, c2);
-        *p.add(33) = b' ';
-        _mm_storeu_si128(p.add(34) as *mut __m128i, c3);
-        _mm_storeu_si128(p.add(46) as *mut __m128i, c4);
-        *p.add(58) = b' ';
-        *p.add(59) = b'|';
-        _mm_storeu_si128(p.add(60) as *mut __m128i, $ascii);
-        *p.add(76) = b'|';
-        *p.add(77) = b'\n';
-    }};
+    }
+    if no_ascii {
+        dst.push(b'\n');
+        return;
+    }
+    dst.push(b'|');
+    for i in 0..n {
+        let b = src[i];
+        dst.push(if b >= 0x20 && b <= 0x7e { b } else { b'.' });
+    }
+    for _ in n..width {
+        dst.push(b' ');
+    }
+    dst.push(b'|');
+    dst.push(b'\n');
+}
+
+fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
+    let mut derive_opts = opts.clone();
+    derive_opts.endian = Endian::Big;
+    let mut r1 = Vec::new();
+    let mut r2 = Vec::new();
+    match kind {
+        LayoutKind::OutputLine if !output_line_diverts(opts) => {
+            output_line(&mut r1, &vec![0x55; n], 0, &derive_opts, false, 0, 0).unwrap();
+            output_line(&mut r2, &vec![0xAA; n], 1, &derive_opts, false, 0, 0).unwrap();
+        }
+        LayoutKind::Scalar => {
+            format_scalar_row(&mut r1, &vec![0x55; n], 0, opts.no_ascii);
+            format_scalar_row(&mut r2, &vec![0xAA; n], 1, opts.no_ascii);
+        }
+        _ => {
+            format_row_generic(&mut r1, &vec![0x55; n], 0, &derive_opts);
+            format_row_generic(&mut r2, &vec![0xAA; n], 1, &derive_opts);
+        }
+    }
+    let bar = match opts.border {
+        BorderStyle::None    => "",
+        BorderStyle::Ascii   => "|",
+        BorderStyle::Unicode => "│",
+    };
+    let pos_w = (if opts.offset_dec { 20 } else { offset_len(u64::MAX) }) + 1;
+    let prefix_len = if opts.border != BorderStyle::None {
+        bar.len() + if opts.no_position { 0 } else { pos_w }
+    } else if opts.no_position {
+        0
+    } else {
+        field_len_for(opts, 0) + 2
+    };
+    let mut suffix = r1[prefix_len..].to_vec();
+    for i in 0..suffix.len() {
+        if r1[prefix_len + i] != r2[prefix_len + i] {
+            suffix[i] = 0xFF;
+        }
+    }
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < suffix.len() {
+        if suffix[i] == 0xFF {
+            let s = i;
+            while i < suffix.len() && suffix[i] == 0xFF { i += 1; }
+            runs.push((s, i - s));
+        } else {
+            i += 1;
+        }
+    }
+    let mut hex_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut tail_runs: Vec<(usize, usize)> = Vec::new();
+    for &(s, l) in &runs {
+        if l == 2 && hex_pairs.len() < n {
+            hex_pairs.push((s, s + 1));
+        } else {
+            tail_runs.push((s, l));
+        }
+    }
+    let mut ascii_off = 0usize;
+    let mut ascii_run = 0usize;
+    let mut ascii_pairs: Vec<(usize, usize)> = Vec::new();
+    match opts.table {
+        CharTable::Braille => {
+            for &(s, l) in &tail_runs {
+                if l == 2 {
+                    if ascii_pairs.is_empty() { ascii_off = s; }
+                    ascii_pairs.push((s, s + 1));
+                }
+            }
+        }
+        _ => {
+            for &(s, l) in &tail_runs {
+                if ascii_run == 0 { ascii_off = s; }
+                ascii_run = s + l - ascii_off;
+            }
+        }
+    }
+    let build_windows = |pairs: &[(usize, usize)], suffix: &[u8]| -> Vec<HexWin> {
+        let mut out = Vec::new();
+        let npairs = pairs.len();
+        for q0 in (0..npairs).step_by(4) {
+            let start = pairs[q0].0;
+            let mut idx = [-1i8; 16];
+            let mut sp = [0u8; 16];
+            for k in 0..16 {
+                let pos = start + k;
+                let mut hit = None;
+                for j in q0..(q0 + 4).min(npairs) {
+                    for c in 0..2 {
+                        let slot = if c == 0 { pairs[j].0 } else { pairs[j].1 };
+                        if slot == pos {
+                            hit = Some(((j - q0) * 2 + c + ((q0 / 4) & 1) * 8) as i8);
+                        }
+                    }
+                }
+                match hit {
+                    Some(v) => idx[k] = v,
+                    None => sp[k] = if pos < suffix.len() { suffix[pos] } else { b' ' },
+                }
+            }
+            out.push(HexWin { off: start, idx, sp });
+        }
+        out
+    };
+    let windows = build_windows(&hex_pairs, &suffix);
+    let ascii_windows = if opts.table == CharTable::Braille {
+        build_windows(&ascii_pairs, &suffix)
+    } else { Vec::new() };
+    let emitted = suffix.len();
+    let mut covered = vec![false; emitted];
+    for w in &windows {
+        for k in w.off..(w.off + 16).min(emitted) { covered[k] = true; }
+    }
+    for w in &ascii_windows {
+        for k in w.off..(w.off + 16).min(emitted) { covered[k] = true; }
+    }
+    if opts.table == CharTable::Ascii {
+        for k in ascii_off..(ascii_off + ascii_run).min(emitted) { covered[k] = true; }
+    }
+    let mut consts: Vec<ConstBlock> = Vec::new();
+    let mut i = 0;
+    while i < emitted {
+        if !covered[i] {
+            let s = i;
+            while i < emitted && !covered[i] { i += 1; }
+            let mut p = s;
+            while p < i {
+                let rem = i - p;
+                let l = if rem >= 8 { 8 } else if rem >= 4 { 4 } else if rem >= 2 { 2 } else { 1 };
+                let mut val = 0u64;
+                for k in 0..l {
+                    val |= (suffix[p + k] as u64) << (k * 8);
+                }
+                consts.push(ConstBlock { off: p, len: l as u8, val });
+                p += l;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    let all_fit = windows.iter().all(|w| w.off + 16 <= emitted)
+        && ascii_windows.iter().all(|w| w.off + 16 <= emitted);
+    let fast = if opts.width == 16 && opts.table == CharTable::Ascii && opts.endian == Endian::Big {
+        let mut k = CanonKernel {
+            idx_a:  [[-1i8; 16]; 3],
+            idx_b:  [[-1i8; 16]; 3],
+            sp:     [[0u8; 16]; 3],
+            t0_idx: [-1i8; 16],
+            t0_sp:  [0u8; 16],
+            t1_idx: [-1i8; 16],
+            t1_sp:  [0u8; 16],
+            tail:   (0, 0),
+        };
+        let mut ok = true;
+        for (bi, base) in [0usize, 16, 32].iter().enumerate() {
+            for kk in 0..16 {
+                let pos = base + kk;
+                if let Some(ci) = hex_pairs.iter().position(|&(a, b)| a == pos || b == pos) {
+                    let c = if hex_pairs[ci].0 == pos { 2 * ci } else { 2 * ci + 1 };
+                    if c < 16 { k.idx_a[bi][kk] = c as i8; } else { k.idx_b[bi][kk] = (c - 16) as i8; }
+                } else if pos < suffix.len() && suffix[pos] != 0xFF {
+                    k.sp[bi][kk] = suffix[pos];
+                } else {
+                    ok = false;
+                }
+            }
+        }
+        if emitted >= 68 {
+            for kk in 0..16 {
+                let pos = 48 + kk;
+                if pos >= ascii_off && pos < ascii_off + ascii_run && pos - ascii_off < 16 {
+                    k.t0_idx[kk] = (pos - ascii_off) as i8;
+                } else if pos < suffix.len() && suffix[pos] != 0xFF {
+                    k.t0_sp[kk] = suffix[pos];
+                } else {
+                    ok = false;
+                }
+            }
+            for kk in 0..4 {
+                let pos = 64 + kk;
+                if pos >= ascii_off && pos < ascii_off + ascii_run && pos - ascii_off < 16 {
+                    k.t1_idx[kk] = (pos - ascii_off) as i8;
+                } else if pos < suffix.len() && suffix[pos] != 0xFF {
+                    k.t1_sp[kk] = suffix[pos];
+                } else {
+                    ok = false;
+                }
+            }
+        } else {
+            ok = false;
+        }
+        if ok && consts.len() == 1 && consts[0].len == 2 {
+            k.tail = (consts[0].off, consts[0].val as u16);
+            Some(k)
+        } else { None }
+    } else { None };
+    let esc_mask = if opts.endian == Endian::Little && opts.group > 1 {
+        let g = opts.group;
+        let rem = n % g;
+        if rem != 0 {
+            let grp_start = n - rem;
+            let last_start = ((n + 15) / 16 - 1) * 16;
+            let mut m = [0xFFu8; 16];
+            for j in 0..16 {
+                let i = last_start + j;
+                if i >= grp_start && i < n && i % g <= g - 1 - rem {
+                    m[j] = 0x00;
+                }
+            }
+            Some(m)
+        } else { None }
+    } else { None };
+    RowLayout { emitted, windows, ascii_windows, ascii_off, ascii_run, esc_mask, consts, all_fit, fast }
+}
+
+impl RowCfg {
+    fn new(opts: &Options, full_kind: LayoutKind, tail_kind: LayoutKind) -> RowCfg {
+        let width  = opts.width;
+        let blocks = (width + 15) / 16;
+        let full   = build_layout(opts, width, full_kind);
+        let pos_w  = (if opts.offset_dec { 20 } else { offset_len(u64::MAX) }) + 1;
+        let bar = match opts.border {
+            BorderStyle::None    => [0u8; 3],
+            BorderStyle::Ascii   => [b'|', 0, 0],
+            BorderStyle::Unicode => [0xe2, 0x94, 0x82],
+        };
+        let bar_len = match opts.border {
+            BorderStyle::None => 0, BorderStyle::Ascii => 1, BorderStyle::Unicode => 3,
+        };
+        let fixed_prefix = opts.border != BorderStyle::None || opts.no_position;
+        let prefix_fixed = if fixed_prefix {
+            bar_len + if opts.no_position { 0 } else { pos_w }
+        } else { 0 };
+        let rev = if opts.endian == Endian::Little && opts.group > 1 {
+            let g = opts.group;
+            let mut m = [0i8; 16];
+            for j in 0..16 {
+                m[j] = ((j / g) * g + (g - 1 - j % g)) as i8;
+            }
+            Some(m)
+        } else { None };
+        RowCfg {
+            core: RowCore {
+                opts: opts.clone(), width, blocks,
+                fixed_prefix, prefix_fixed, pos_w, bar, bar_len, full, rev,
+                tail_kind,
+            },
+            tails: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn layout(&self, n: usize) -> &RowLayout {
+        if n == self.core.width {
+            &self.core.full
+        } else {
+            let mut t = self.tails.borrow_mut();
+            t.entry(n).or_insert_with(|| build_layout(&self.core.opts, n, self.core.tail_kind));
+            unsafe { &*(t.get(&n).unwrap() as *const RowLayout) }
+        }
+    }
+}
+
+impl RowCore {
+    fn prefix_len(&self, field_len: usize) -> usize {
+        if self.fixed_prefix { self.prefix_fixed } else { field_len + 2 }
+    }
+}
+
+fn can_pair(core: &RowCore) -> bool {
+    core.width == 16
+        && core.rev.is_none()
+        && core.full.windows.len() == 4
+        && core.full.ascii_run >= 16
+        && core.full.ascii_windows.is_empty()
+        && core.opts.table == CharTable::Ascii
+}
+
+#[target_feature(enable = "sse4.1")]
+unsafe fn hex_offsets_4(off: u64, lut: &[u8; 16]) -> [u64; 4] {
+    let base  = _mm_set1_epi32(off as i32);
+    let delta = _mm_setr_epi32(0, 16, 32, 48);
+    let x = _mm_add_epi32(base, delta);
+    let x = _mm_shuffle_epi8(x, _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12));
+    let m = _mm_set1_epi8(0x0f);
+    let lo = _mm_and_si128(x, m);
+    let hi = _mm_and_si128(_mm_srli_epi16(x, 4), m);
+    let lutv = _mm_loadu_si128(lut.as_ptr() as *const __m128i);
+    let hlo = _mm_shuffle_epi8(lutv, lo);
+    let hhi = _mm_shuffle_epi8(lutv, hi);
+    let plo = _mm_unpacklo_epi8(hhi, hlo);
+    let phi = _mm_unpackhi_epi8(hhi, hlo);
+    [
+        _mm_cvtsi128_si64(plo) as u64,
+        _mm_cvtsi128_si64(_mm_srli_si128(plo, 8)) as u64,
+        _mm_cvtsi128_si64(phi) as u64,
+        _mm_cvtsi128_si64(_mm_srli_si128(phi, 8)) as u64,
+    ]
+}
+
+#[inline(always)]
+unsafe fn write_hex_offset(dst: *mut u8, off: u64, lut: &[u8; 16]) -> usize {
+    if off <= 0xFFFF_FFFF {
+        for k in 0..8 {
+            *dst.add(7 - k) = lut[((off >> (k * 4)) & 0xf) as usize];
+        }
+        8
+    } else {
+        let len = offset_len(off);
+        for k in 0..len {
+            *dst.add(len - 1 - k) = lut[((off >> (k * 4)) & 0xf) as usize];
+        }
+        len
+    }
+}
+
+#[inline(always)]
+unsafe fn write_prefix(dst: *mut u8, off: u64, core: &RowCore) -> usize {
+    let mut p = dst;
+    let lut = if core.opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+    if core.opts.border != BorderStyle::None {
+        if !core.opts.no_position {
+            std::ptr::copy_nonoverlapping(core.bar.as_ptr(), p, core.bar_len);
+            p = p.add(core.bar_len);
+            let olen = if core.opts.offset_dec {
+                let mut tmp = [0u8; 20];
+                let olen = write_offset(&mut tmp, off, true, false);
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+                olen
+            } else {
+                write_hex_offset(p, off, lut)
+            };
+            p = p.add(olen);
+            *p = b':';
+            p = p.add(1);
+            let pad = core.pos_w.saturating_sub(olen + 1);
+            for _ in 0..pad {
+                *p = b' ';
+                p = p.add(1);
+            }
+        } else {
+            std::ptr::copy_nonoverlapping(core.bar.as_ptr(), p, core.bar_len);
+            p = p.add(core.bar_len);
+        }
+    } else if !core.opts.no_position {
+        if core.opts.offset_dec {
+            let mut tmp = [0u8; 20];
+            let olen = write_offset(&mut tmp, off, true, false);
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+            p = p.add(olen);
+        } else {
+            p = p.add(write_hex_offset(p, off, lut));
+        }
+        *p = b':';
+        *p.add(1) = b' ';
+        p = p.add(2);
+    }
+    p as usize - dst as usize
+}
+
+#[target_feature(enable = "ssse3,sse4.1")]
+unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
+                     core: &RowCore, layout: &RowLayout) -> usize {
+    let blocks = (n + 15) / 16;
+    let p = dst.add(write_prefix(dst, off, core));
+    for cb in &layout.consts {
+        store_block(p, cb);
+    }
+    for b in 0..blocks {
+        let raw = _mm_loadu_si128(src.add(b * 16) as *const __m128i);
+        let input = match &core.rev {
+            Some(m) => {
+                let rev = _mm_shuffle_epi8(raw, _mm_loadu_si128(m.as_ptr() as *const __m128i));
+                if b == blocks - 1 {
+                    if let Some(em) = &layout.esc_mask {
+                        _mm_and_si128(rev, _mm_loadu_si128(em.as_ptr() as *const __m128i))
+                    } else { rev }
+                } else { rev }
+            }
+            None => raw,
+        };
+        let m0f = _mm_set1_epi8(0x0f);
+        let lo  = _mm_and_si128(input, m0f);
+        let hi  = _mm_and_si128(_mm_srli_epi16(input, 4), m0f);
+        let lut = if core.opts.uppercase {
+            _mm_loadu_si128(HEX_UPPER.as_ptr() as *const __m128i)
+        } else {
+            _mm_loadu_si128(HEX_LOWER.as_ptr() as *const __m128i)
+        };
+        let hlo = _mm_shuffle_epi8(lut, lo);
+        let hhi = _mm_shuffle_epi8(lut, hi);
+        let plo = _mm_unpacklo_epi8(hhi, hlo);
+        let phi = _mm_unpackhi_epi8(hhi, hlo);
+        if layout.all_fit {
+            for q in 0..4 {
+                let wi = b * 4 + q;
+                if wi >= layout.windows.len() { break; }
+                let w = &layout.windows[wi];
+                let half = if q < 2 { plo } else { phi };
+                let v = _mm_or_si128(
+                    _mm_shuffle_epi8(half, _mm_loadu_si128(w.idx.as_ptr() as *const __m128i)),
+                    _mm_loadu_si128(w.sp.as_ptr() as *const __m128i));
+                _mm_storeu_si128(p.add(w.off) as *mut __m128i, v);
+            }
+        } else {
+            for q in 0..4 {
+                let wi = b * 4 + q;
+                if wi >= layout.windows.len() { break; }
+                let w = &layout.windows[wi];
+                let half = if q < 2 { plo } else { phi };
+                let v = _mm_or_si128(
+                    _mm_shuffle_epi8(half, _mm_loadu_si128(w.idx.as_ptr() as *const __m128i)),
+                    _mm_loadu_si128(w.sp.as_ptr() as *const __m128i));
+                if w.off + 16 <= layout.emitted {
+                    _mm_storeu_si128(p.add(w.off) as *mut __m128i, v);
+                } else {
+                    let mut tmp = [0u8; 16];
+                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), p.add(w.off), layout.emitted - w.off);
+                }
+            }
+        }
+    }
+    match core.opts.table {
+        CharTable::Ascii => {
+            let mut done = 0usize;
+            for b in 0..blocks {
+                let avail = layout.ascii_run.saturating_sub(done);
+                if avail == 0 { break; }
+                let raw = _mm_loadu_si128(src.add(b * 16) as *const __m128i);
+                if avail >= 16 {
+                    let pr = _mm_and_si128(
+                        _mm_cmpgt_epi8(raw, _mm_set1_epi8(0x1f)),
+                        _mm_cmpgt_epi8(_mm_set1_epi8(0x7f), raw));
+                    let asc = _mm_blendv_epi8(_mm_set1_epi8(b'.' as i8), raw, pr);
+                    _mm_storeu_si128(p.add(layout.ascii_off + done) as *mut __m128i, asc);
+                    done += 16;
+                } else {
+                    let d = p.add(layout.ascii_off + done);
+                    for j in 0..avail {
+                        let c = *src.add(b * 16 + j);
+                        *d.add(j) = if (0x20..=0x7e).contains(&c) { c } else { b'.' };
+                    }
+                    done += avail;
+                }
+            }
+        }
+        CharTable::Braille => {
+            for b in 0..blocks {
+                if b * 4 >= layout.ascii_windows.len() { break; }
+                let raw = _mm_loadu_si128(src.add(b * 16) as *const __m128i);
+                let v1 = _mm_add_epi8(
+                    _mm_and_si128(_mm_srli_epi16(raw, 6), _mm_set1_epi8(0x03)),
+                    _mm_set1_epi8(0xa0u8 as i8));
+                let v2 = _mm_or_si128(_mm_and_si128(raw, _mm_set1_epi8(0x3f)),
+                                      _mm_set1_epi8(0x80u8 as i8));
+                let plo = _mm_unpacklo_epi8(v1, v2);
+                let phi = _mm_unpackhi_epi8(v1, v2);
+                for q in 0..4 {
+                    let wi = b * 4 + q;
+                    if wi >= layout.ascii_windows.len() { break; }
+                    let w = &layout.ascii_windows[wi];
+                    let half = if q < 2 { plo } else { phi };
+                    let v = _mm_or_si128(
+                        _mm_shuffle_epi8(half, _mm_loadu_si128(w.idx.as_ptr() as *const __m128i)),
+                        _mm_loadu_si128(w.sp.as_ptr() as *const __m128i));
+                    if w.off + 16 <= layout.emitted {
+                        _mm_storeu_si128(p.add(w.off) as *mut __m128i, v);
+                    } else {
+                        let mut tmp = [0u8; 16];
+                        _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+                        std::ptr::copy_nonoverlapping(tmp.as_ptr(), p.add(w.off), layout.emitted - w.off);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    (p as usize - dst as usize) + layout.emitted
 }
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
-unsafe fn format_two_rows_avx2(dst: *mut u8, src: *const u8, off: u64, off_len: usize) {
-    let orb = off_len + 71; // +2 for | | around ASCII panel
-    write_offset_n(dst, off, off_len);
-    *dst.add(off_len) = b':';
-    *dst.add(off_len + 1) = b' ';
-    write_offset_n(dst.add(orb), off.wrapping_add(16), off_len);
-    *dst.add(orb + off_len) = b':';
-    *dst.add(orb + off_len + 1) = b' ';
-
-    let input  = _mm256_loadu_si256(src as *const __m256i);
-    let lo_msk = _mm256_set1_epi8(0x0f_u8 as i8);
-    let lut    = _mm256_broadcastsi128_si256(_mm_setr_epi8(
-        b'0' as i8,b'1' as i8,b'2' as i8,b'3' as i8,b'4' as i8,b'5' as i8,
-        b'6' as i8,b'7' as i8,b'8' as i8,b'9' as i8,b'a' as i8,b'b' as i8,
-        b'c' as i8,b'd' as i8,b'e' as i8,b'f' as i8));
-    let lo  = _mm256_and_si256(input, lo_msk);
-    let hi  = _mm256_and_si256(_mm256_srli_epi16(input, 4), lo_msk);
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn format_pair(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 2], fast_off: bool,
+                      idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
+                      core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+    let raw = _mm256_loadu_si256(src as *const __m256i);
+    let input = match &core.rev {
+        Some(m) => _mm256_shuffle_epi8(
+            raw, _mm256_broadcastsi128_si256(_mm_loadu_si128(m.as_ptr() as *const __m128i))),
+        None => raw,
+    };
+    let m0f = _mm256_set1_epi8(0x0f);
+    let lo  = _mm256_and_si256(input, m0f);
+    let hi  = _mm256_and_si256(_mm256_srli_epi16(input, 4), m0f);
+    let lut = if core.opts.uppercase {
+        _mm256_broadcastsi128_si256(_mm_loadu_si128(HEX_UPPER.as_ptr() as *const __m128i))
+    } else {
+        _mm256_broadcastsi128_si256(_mm_loadu_si128(HEX_LOWER.as_ptr() as *const __m128i))
+    };
     let hlo = _mm256_shuffle_epi8(lut, lo);
     let hhi = _mm256_shuffle_epi8(lut, hi);
     let plo = _mm256_unpacklo_epi8(hhi, hlo);
     let phi = _mm256_unpackhi_epi8(hhi, hlo);
-
-    let r0_plo = _mm256_castsi256_si128(plo);
-    let r0_phi = _mm256_castsi256_si128(phi);
-    let r1_plo = _mm256_extracti128_si256(plo, 1);
-    let r1_phi = _mm256_extracti128_si256(phi, 1);
-
-    let dot  = _mm256_set1_epi8(b'.' as i8);
-    let low  = _mm256_set1_epi8(0x1f_u8 as i8);
-    let high = _mm256_set1_epi8(0x7f_u8 as i8);
-    let pr   = _mm256_and_si256(
-        _mm256_cmpgt_epi8(input, low), _mm256_cmpgt_epi8(high, input));
-    let asc  = _mm256_blendv_epi8(dot, input, pr);
-    let asc0 = _mm256_castsi256_si128(asc);
-    let asc1 = _mm256_extracti128_si256(asc, 1);
-
-    expand_and_store!(dst.add(off_len - 7), r0_plo, r0_phi, asc0);
-    expand_and_store!(dst.add(orb + off_len - 7), r1_plo, r1_phi, asc1);
+    let pr = _mm256_and_si256(
+        _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
+    let asc = _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr);
+    for r in 0..2 {
+        let d = dst.add(r * row_len);
+        let p = if fast_off {
+            std::ptr::write_unaligned(d as *mut u64, o8[r]);
+            *d.add(8) = b':';
+            *d.add(9) = b' ';
+            d.add(10)
+        } else {
+            d.add(write_prefix(d, off.wrapping_add(r as u64 * 16), core))
+        };
+        for cb in &layout.consts {
+            store_block(p, cb);
+        }
+        let plo_r = if r == 0 { _mm256_castsi256_si128(plo) } else { _mm256_extracti128_si256(plo, 1) };
+        let phi_r = if r == 0 { _mm256_castsi256_si128(phi) } else { _mm256_extracti128_si256(phi, 1) };
+        if layout.all_fit && layout.windows.len() == 4 {
+            for q in 0..4 {
+                let off_q = layout.windows[q].off;
+                let half = if q < 2 { plo_r } else { phi_r };
+                let v = _mm_or_si128(
+                    _mm_shuffle_epi8(half, _mm_loadu_si128(idx[q].as_ptr() as *const __m128i)),
+                    _mm_loadu_si128(sp[q].as_ptr() as *const __m128i));
+                _mm_storeu_si128(p.add(off_q) as *mut __m128i, v);
+            }
+        } else {
+            for q in 0..4 {
+                let off_q = layout.windows[q].off;
+                let half = if q < 2 { plo_r } else { phi_r };
+                let v = _mm_or_si128(
+                    _mm_shuffle_epi8(half, _mm_loadu_si128(idx[q].as_ptr() as *const __m128i)),
+                    _mm_loadu_si128(sp[q].as_ptr() as *const __m128i));
+                if off_q + 16 <= layout.emitted {
+                    _mm_storeu_si128(p.add(off_q) as *mut __m128i, v);
+                } else {
+                    let mut tmp = [0u8; 16];
+                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), p.add(off_q), layout.emitted - off_q);
+                }
+            }
+        }
+        let asc_r = if r == 0 { _mm256_castsi256_si128(asc) } else { _mm256_extracti128_si256(asc, 1) };
+        if layout.ascii_run >= 16 {
+            _mm_storeu_si128(p.add(layout.ascii_off) as *mut __m128i, asc_r);
+        }
+    }
+    row_len * 2
 }
 
-#[target_feature(enable = "ssse3,sse4.1")]
-unsafe fn format_row_simd(dst: *mut u8, src: *const u8, off: u64, off_len: usize) {
-    write_offset_n(dst, off, off_len);
-    *dst.add(off_len) = b':';
-    *dst.add(off_len + 1) = b' ';
-    // Shift base so expand_and_store!(base) writes hex at base[9] and newline at base[75].
-    // off_len=8: base=dst,   row=76 bytes. off_len=9: base=dst+1, row=77 bytes. All SIMD.
-    let dst = dst.add(off_len - 7);
+fn pair_masks(layout: &RowLayout) -> ([[i8; 16]; 4], [[u8; 16]; 4]) {
+    let mut idx = [[0i8; 16]; 4];
+    let mut sp  = [[0u8; 16]; 4];
+    for q in 0..4 {
+        idx[q] = layout.windows[q].idx;
+        sp[q]  = layout.windows[q].sp;
+    }
+    (idx, sp)
+}
 
-    let input  = _mm_loadu_si128(src as *const __m128i);
-    let lo_msk = _mm_set1_epi8(0x0f_u8 as i8);
-    let lut    = _mm_setr_epi8(
-        b'0' as i8,b'1' as i8,b'2' as i8,b'3' as i8,b'4' as i8,b'5' as i8,
-        b'6' as i8,b'7' as i8,b'8' as i8,b'9' as i8,b'a' as i8,b'b' as i8,
-        b'c' as i8,b'd' as i8,b'e' as i8,b'f' as i8);
-    let lo  = _mm_and_si128(input, lo_msk);
-    let hi  = _mm_and_si128(_mm_srli_epi16(input, 4), lo_msk);
-    let hlo = _mm_shuffle_epi8(lut, lo);
-    let hhi = _mm_shuffle_epi8(lut, hi);
-    let plo = _mm_unpacklo_epi8(hhi, hlo);
-    let phi = _mm_unpackhi_epi8(hhi, hlo);
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn format_four_rows(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 4], fast_off: bool,
+                           idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
+                           core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+    let raw = _mm512_loadu_si512(src as *const _);
+    let input = match &core.rev {
+        Some(m) => _mm512_shuffle_epi8(
+            raw, _mm512_broadcast_i32x4(_mm_loadu_si128(m.as_ptr() as *const __m128i))),
+        None => raw,
+    };
+    let m0f = _mm512_set1_epi8(0x0f);
+    let lo  = _mm512_and_si512(input, m0f);
+    let hi  = _mm512_and_si512(_mm512_srli_epi16(input, 4), m0f);
+    let lut = if core.opts.uppercase {
+        _mm512_broadcast_i32x4(_mm_loadu_si128(HEX_UPPER.as_ptr() as *const __m128i))
+    } else {
+        _mm512_broadcast_i32x4(_mm_loadu_si128(HEX_LOWER.as_ptr() as *const __m128i))
+    };
+    let hlo = _mm512_shuffle_epi8(lut, lo);
+    let hhi = _mm512_shuffle_epi8(lut, hi);
+    let plo = _mm512_unpacklo_epi8(hhi, hlo);
+    let phi = _mm512_unpackhi_epi8(hhi, hlo);
+    let pr = _mm512_cmpgt_epi8_mask(raw, _mm512_set1_epi8(0x1f))
+        & _mm512_cmpgt_epi8_mask(_mm512_set1_epi8(0x7f), raw);
+    let asc = _mm512_mask_blend_epi8(pr, _mm512_set1_epi8(b'.' as i8), raw);
+    for r in 0..4 {
+        let d = dst.add(r * row_len);
+        let p = if fast_off {
+            std::ptr::write_unaligned(d as *mut u64, o8[r]);
+            *d.add(8) = b':';
+            *d.add(9) = b' ';
+            d.add(10)
+        } else {
+            d.add(write_prefix(d, off.wrapping_add(r as u64 * 16), core))
+        };
+        for cb in &layout.consts {
+            store_block(p, cb);
+        }
+        let plo_r = match r {
+            0 => _mm512_castsi512_si128(plo),
+            1 => _mm512_extracti32x4_epi32(plo, 1),
+            2 => _mm512_extracti32x4_epi32(plo, 2),
+            _ => _mm512_extracti32x4_epi32(plo, 3),
+        };
+        let phi_r = match r {
+            0 => _mm512_castsi512_si128(phi),
+            1 => _mm512_extracti32x4_epi32(phi, 1),
+            2 => _mm512_extracti32x4_epi32(phi, 2),
+            _ => _mm512_extracti32x4_epi32(phi, 3),
+        };
+        if layout.all_fit && layout.windows.len() == 4 {
+            for q in 0..4 {
+                let off_q = layout.windows[q].off;
+                let half = if q < 2 { plo_r } else { phi_r };
+                let v = _mm_or_si128(
+                    _mm_shuffle_epi8(half, _mm_loadu_si128(idx[q].as_ptr() as *const __m128i)),
+                    _mm_loadu_si128(sp[q].as_ptr() as *const __m128i));
+                _mm_storeu_si128(p.add(off_q) as *mut __m128i, v);
+            }
+        } else {
+            for q in 0..4 {
+                let off_q = layout.windows[q].off;
+                let half = if q < 2 { plo_r } else { phi_r };
+                let v = _mm_or_si128(
+                    _mm_shuffle_epi8(half, _mm_loadu_si128(idx[q].as_ptr() as *const __m128i)),
+                    _mm_loadu_si128(sp[q].as_ptr() as *const __m128i));
+                if off_q + 16 <= layout.emitted {
+                    _mm_storeu_si128(p.add(off_q) as *mut __m128i, v);
+                } else {
+                    let mut tmp = [0u8; 16];
+                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), p.add(off_q), layout.emitted - off_q);
+                }
+            }
+        }
+        let asc_r = match r {
+            0 => _mm512_castsi512_si128(asc),
+            1 => _mm512_extracti32x4_epi32(asc, 1),
+            2 => _mm512_extracti32x4_epi32(asc, 2),
+            _ => _mm512_extracti32x4_epi32(asc, 3),
+        };
+        if layout.ascii_run >= 16 {
+            _mm_storeu_si128(p.add(layout.ascii_off) as *mut __m128i, asc_r);
+        }
+    }
+    row_len * 4
+}
 
-    let pr  = _mm_and_si128(
-        _mm_cmpgt_epi8(input, _mm_set1_epi8(0x1f_u8 as i8)),
-        _mm_cmpgt_epi8(_mm_set1_epi8(0x7f_u8 as i8), input));
-    let asc = _mm_blendv_epi8(_mm_set1_epi8(b'.' as i8), input, pr);
+fn fast_offsets_ok(core: &RowCore, off: u64) -> bool {
+    core.opts.border == BorderStyle::None
+        && !core.opts.no_position
+        && !core.opts.offset_dec
+        && off < 0xFFFF_FFF0
+}
 
-    expand_and_store!(dst, plo, phi, asc);
+unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
+                          core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+    let lut = if core.opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+    let fast_off = fast_offsets_ok(core, off);
+    if fast_off {
+        if let Some(k) = &layout.fast {
+            let o8 = hex_offsets_4(off, lut);
+            return format_pair_fast(dst, src, [o8[0], o8[1]], k, lut, row_len);
+        }
+    }
+    let (idx, sp) = pair_masks(layout);
+    let o8 = if fast_off {
+        hex_offsets_4(off, lut)
+    } else { [0; 4] };
+    format_pair(dst, src, off, [o8[0], o8[1]], fast_off, &idx, &sp, core, layout, row_len)
+}
+
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
+                           k: &CanonKernel, lut: &[u8; 16], row_len: usize) -> usize {
+    let raw = _mm256_loadu_si256(src as *const __m256i);
+    let m0f = _mm256_set1_epi8(0x0f);
+    let lo  = _mm256_and_si256(raw, m0f);
+    let hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), m0f);
+    let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.as_ptr() as *const __m128i));
+    let hlo = _mm256_shuffle_epi8(lut, lo);
+    let hhi = _mm256_shuffle_epi8(lut, hi);
+    let plo = _mm256_unpacklo_epi8(hhi, hlo);
+    let phi = _mm256_unpackhi_epi8(hhi, hlo);
+    let pr = _mm256_and_si256(
+        _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
+        _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
+    let asc = _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr);
+    for r in 0..2 {
+        let d = dst.add(r * row_len);
+        std::ptr::write_unaligned(d as *mut u64, o8[r]);
+        *d.add(8) = b':';
+        *d.add(9) = b' ';
+        let p = d.add(10);
+        let plo_r = if r == 0 { _mm256_castsi256_si128(plo) } else { _mm256_extracti128_si256(plo, 1) };
+        let phi_r = if r == 0 { _mm256_castsi256_si128(phi) } else { _mm256_extracti128_si256(phi, 1) };
+        let v0 = _mm_or_si128(
+            _mm_shuffle_epi8(plo_r, _mm_loadu_si128(k.idx_a[0].as_ptr() as *const __m128i)),
+            _mm_loadu_si128(k.sp[0].as_ptr() as *const __m128i));
+        let v1 = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo_r, _mm_loadu_si128(k.idx_a[1].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi_r, _mm_loadu_si128(k.idx_b[1].as_ptr() as *const __m128i))),
+            _mm_loadu_si128(k.sp[1].as_ptr() as *const __m128i));
+        let v2 = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo_r, _mm_loadu_si128(k.idx_a[2].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi_r, _mm_loadu_si128(k.idx_b[2].as_ptr() as *const __m128i))),
+            _mm_loadu_si128(k.sp[2].as_ptr() as *const __m128i));
+        let t0 = _mm_or_si128(
+            _mm_shuffle_epi8(asc_extract(r, asc), _mm_loadu_si128(k.t0_idx.as_ptr() as *const __m128i)),
+            _mm_loadu_si128(k.t0_sp.as_ptr() as *const __m128i));
+        let t1 = _mm_or_si128(
+            _mm_shuffle_epi8(asc_extract(r, asc), _mm_loadu_si128(k.t1_idx.as_ptr() as *const __m128i)),
+            _mm_loadu_si128(k.t1_sp.as_ptr() as *const __m128i));
+        _mm_storeu_si128(p as *mut __m128i, v0);
+        _mm_storeu_si128(p.add(16) as *mut __m128i, v1);
+        _mm_storeu_si128(p.add(32) as *mut __m128i, v2);
+        _mm_storeu_si128(p.add(48) as *mut __m128i, t0);
+        *(p.add(64) as *mut u32) = _mm_cvtsi128_si64(t1) as u32;
+        *(p.add(k.tail.0) as *mut u16) = k.tail.1;
+    }
+    row_len * 2
+}
+
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn asc_extract(r: usize, asc: __m256i) -> __m128i {
+    if r == 0 { _mm256_castsi256_si128(asc) } else { _mm256_extracti128_si256(asc, 1) }
+}
+
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                                lut: &[u8; 16], k: &CanonKernel, row_len: usize) {
+    for i in 0..pairs {
+        let o8 = hex_offsets_4(off.wrapping_add((i * 32) as u64), lut);
+        format_pair_fast(dst.add(i * row_len * 2), src.add(i * 32), [o8[0], o8[1]], k, lut, row_len);
+    }
+}
+
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn format_pairs_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                           idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
+                           lut: &[u8; 16],
+                           core: &RowCore, layout: &RowLayout, row_len: usize) {
+    for k in 0..pairs {
+        let o8 = if fast {
+            hex_offsets_4(off.wrapping_add((k * 32) as u64), lut)
+        } else { [0; 4] };
+        format_pair(dst.add(k * row_len * 2), src.add(k * 32),
+                    off.wrapping_add((k * 32) as u64), [o8[0], o8[1]], fast,
+                    idx, sp, core, layout, row_len);
+    }
+}
+
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn format_fours_run(dst: *mut u8, src: *const u8, off: u64, quads: usize,
+                           idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
+                           lut: &[u8; 16],
+                           core: &RowCore, layout: &RowLayout, row_len: usize) {
+    for k in 0..quads {
+        let o8 = if fast {
+            hex_offsets_4(off.wrapping_add((k * 64) as u64), lut)
+        } else { [0; 4] };
+        format_four_rows(dst.add(k * row_len * 4), src.add(k * 64),
+                         off.wrapping_add((k * 64) as u64), o8, fast,
+                         idx, sp, core, layout, row_len);
+    }
 }
 
 fn _write_hex_group(dst: &mut Vec<u8>, src: &[u8], group: usize, endian: Endian,
@@ -1711,17 +2519,31 @@ fn use_color(opts: &Options) -> bool {
 /// True iff we can use the SIMD canonical fast path (no generic overhead).
 fn is_simd_eligible(opts: &Options, do_color: bool) -> bool {
     opts.mode == DisplayMode::Canonical
+        && !do_color
+        && matches!(opts.table, CharTable::Ascii | CharTable::Braille)
+        && opts.formats.is_empty()
+}
+
+fn old_simd_eligible(opts: &Options) -> bool {
+    opts.mode == DisplayMode::Canonical
         && opts.width == 16
         && opts.group == 1
         && opts.endian == Endian::Big
         && !opts.no_ascii
         && !opts.no_position
         && opts.border == BorderStyle::None
-        && !do_color
         && !opts.uppercase
         && !opts.offset_dec
         && opts.table == CharTable::Ascii
         && opts.formats.is_empty()
+}
+
+fn output_line_diverts(opts: &Options) -> bool {
+    opts.mode != DisplayMode::Canonical
+        || opts.group != 1
+        || opts.endian != Endian::Big
+        || opts.no_position
+        || opts.no_ascii
 }
 
 /// Multi-file concatenated reader.
@@ -1842,16 +2664,18 @@ fn main() -> io::Result<()> {
             let use_avx2 = simd_ok && is_x86_feature_detected!("avx2");
             let use_simd = simd_ok && (use_avx2 ||
                 (is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")));
+            let use_avx512 = use_simd
+                && is_x86_feature_detected!("avx512f")
+                && is_x86_feature_detected!("avx512bw");
 
             let needs_serial = opts.mode != DisplayMode::Canonical
-                || do_color || opts.squeeze || opts.border != BorderStyle::None
-                || opts.max_lines.is_some() || !opts.formats.is_empty()
-                || !use_simd; // scalar parallel path ignores opts entirely; serial handles all non-SIMD cases
+                || do_color || opts.squeeze || opts.max_lines.is_some() || !opts.formats.is_empty()
+                || !use_simd;
 
             if needs_serial {
                 return run_serial_mmap(&opts, data, start_disp, do_color, use_simd);
             } else {
-                return run_parallel_mmap(&opts, data, start_disp, use_avx2, use_simd);
+                return run_parallel_mmap(&opts, data, start_disp, use_avx2, use_avx512);
             }
         }
     }
@@ -1900,162 +2724,295 @@ fn main() -> io::Result<()> {
 }
 
 fn run_parallel_mmap(
-    opts:     &Options,
-    data:     &[u8],
-    start_off: u64,
-    use_avx2: bool,
-    use_simd: bool,
+    opts:       &Options,
+    data:       &[u8],
+    start_off:  u64,
+    use_avx2:   bool,
+    use_avx512: bool,
 ) -> io::Result<()> {
-    let bpr     = opts.width;
-    let max_off       = start_off.saturating_add(data.len() as u64);
-    let off_len_simd  = offset_len(max_off);
-    let orb: usize = if use_simd && bpr == 16 {
-        off_len_simd + 71
-    } else {
-        // scalar parallel: offset(up to 20) + ": " + bpr*3 hex + half-space + "|" + bpr ascii + "|\n"
-        20 + 2 + bpr * 3 + 1 + 2 + bpr + 1
-    };
+    let width     = opts.width;
     let file_sz   = data.len();
-    let full_rows = file_sz / bpr;
-    let tail_len  = file_sz % bpr;
-    let chunk_rows = (64 * 1024 * 1024) / orb;
-    let buf_cap    = chunk_rows * orb;
+    let full_rows = file_sz / width;
+    let tail_len  = file_sz % width;
+    let full_kind = if old_simd_eligible(opts) { LayoutKind::Generic } else { LayoutKind::OutputLine };
+    let tail_kind = if old_simd_eligible(opts) { LayoutKind::Scalar } else { LayoutKind::OutputLine };
+    let cfg       = RowCfg::new(opts, full_kind, tail_kind);
+    let core      = &cfg.core;
+    let blocks    = core.blocks;
 
-    let (send_data, recv_data) = sync_channel::<Vec<u8>>(1);
+    let pos_w = if opts.no_position { 0 } else {
+        (if opts.offset_dec { 20 } else { offset_len(u64::MAX) }) + 1
+    };
+    let hex_w   = hex_width(opts);
+    let ascii_w = ascii_width(opts);
+    let has_ascii = !opts.no_ascii;
+    if opts.border != BorderStyle::None {
+        let mut so = io::stdout().lock();
+        border_top(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+        border_header(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+        border_sep(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+        so.flush()?;
+    }
+
+    let field_len_at = |row: usize| field_len_for(opts, start_off.wrapping_add((row * width) as u64));
+    let row_len_at   = |row: usize| core.prefix_len(field_len_at(row)) + core.full.emitted;
+
+    let mut bounds = vec![0usize, full_rows];
+    {
+        let mut push = |v: u64| {
+            if v > start_off {
+                let r = ((v - start_off) as usize).div_ceil(width);
+                if r > 0 && r < full_rows { bounds.push(r); }
+            }
+        };
+        if opts.offset_dec {
+            for k in 8..=19u32 { push(10u64.pow(k)); }
+        } else {
+            for k in 8..=15u32 { push(1u64 << (4 * k)); }
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let first = row_len_at(0);
+    let last  = if full_rows > 0 { row_len_at(full_rows - 1) } else { first };
+    let nbuf = 6usize;
+    let chunk_rows = ((16 * 1024 * 1024) / first.min(last)).max(1);
+    let buf_cap    = chunk_rows * first.max(last) + 16;
+
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_WILLNEED);
+    }
+
+    let (send_data, recv_data) = sync_channel::<Vec<u8>>(nbuf - 1);
     let (send_free, recv_free) = channel::<Vec<u8>>();
-    send_free.send(vec![0u8; buf_cap]).unwrap();
-    send_free.send(vec![0u8; buf_cap]).unwrap();
+    for _ in 0..nbuf {
+        let buf = vec![0u8; buf_cap];
+        #[cfg(unix)]
+        unsafe {
+            libc::madvise(buf.as_ptr() as *mut libc::c_void, buf.len(), libc::MADV_HUGEPAGE);
+        }
+        send_free.send(buf).unwrap();
+    }
 
     let writer = thread::spawn(move || -> io::Result<()> {
         let mut zc = ZeroCopyWriter::new()?;
+        let mut prev: Option<Vec<u8>> = None;
         while let Ok(chunk) = recv_data.recv() {
             zc.write_chunk(&chunk)?;
-            let _ = send_free.send(chunk);
+            if let Some(p) = prev.take() {
+                let _ = send_free.send(p);
+            }
+            prev = Some(chunk);
         }
         Ok(())
     });
 
-    let mut row_cursor = 0usize;
-    while row_cursor < full_rows {
-        let rows = (full_rows - row_cursor).min(chunk_rows);
+    let use_pairs = use_avx2 && width == 16 && opts.table == CharTable::Ascii;
+    let use_fours = use_avx512 && width == 16 && opts.table == CharTable::Ascii
+        && core.full.fast.is_none();
 
-        #[cfg(unix)]
-        {
-            let pf_start = (row_cursor + 2 * chunk_rows) * bpr;
-            if pf_start < file_sz {
-                let pf_len = (chunk_rows * bpr).min(file_sz - pf_start);
-                unsafe {
-                    libc::madvise(data.as_ptr().add(pf_start) as *mut libc::c_void,
-                                  pf_len, libc::MADV_WILLNEED);
+    for s in 0..bounds.len() - 1 {
+        let seg_start = bounds[s];
+        let seg_end   = bounds[s + 1];
+        let row_len   = row_len_at(seg_start);
+        let mut row_cursor = seg_start;
+        while row_cursor < seg_end {
+            let rows = (seg_end - row_cursor).min(chunk_rows);
+
+            let mut chunk_out = recv_free.recv().unwrap();
+            let payload = rows * row_len;
+            chunk_out.resize(payload + 16, 0);
+            {
+                let out_rows = &mut chunk_out[..payload];
+                if use_fours {
+                    let (idx, sp) = pair_masks(&core.full);
+                    let last_off = start_off.wrapping_add(((row_cursor + rows - 1) * width) as u64);
+                    let fast_all = core.opts.border == BorderStyle::None
+                        && !core.opts.no_position
+                        && !core.opts.offset_dec
+                        && last_off.wrapping_add(48) <= 0xFFFF_FFFF;
+                    let lut = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+                    let quads = rows / 4;
+                    let quad_end = quads * 4;
+                    let run_quads = quads / 2;
+                    let run_end = run_quads * 8;
+                    out_rows[..run_end * row_len]
+                        .par_chunks_mut(row_len * 8)
+                        .enumerate()
+                        .for_each(|(i, block)| {
+                            let src_off = (row_cursor + i * 8) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_fours_run(block.as_mut_ptr(), data.as_ptr().add(src_off),
+                                                 off, 2, &idx, &sp, fast_all, lut, core, &core.full, row_len);
+                            }
+                        });
+                    if quad_end > run_end {
+                        let src_off = (row_cursor + run_end) * width;
+                        let off = start_off.wrapping_add(src_off as u64);
+                        unsafe {
+                            format_fours_run(out_rows[run_end * row_len..].as_mut_ptr(), data.as_ptr().add(src_off),
+                                             off, (quad_end - run_end) / 4, &idx, &sp, fast_all, lut, core, &core.full, row_len);
+                        }
+                    }
+                    if rows - quad_end >= 2 {
+                        let src_off = (row_cursor + quad_end) * width;
+                        let off = start_off.wrapping_add(src_off as u64);
+                        if use_avx2 {
+                            let fast_off = fast_offsets_ok(core, off);
+                            let o8 = if fast_off {
+                                unsafe { hex_offsets_4(off, lut) }
+                            } else { [0; 4] };
+                            unsafe {
+                                format_pair(out_rows[quad_end * row_len..].as_mut_ptr(), data.as_ptr().add(src_off),
+                                            off, [o8[0], o8[1]], fast_off, &idx, &sp, core, &core.full, row_len);
+                            }
+                        } else {
+                            unsafe {
+                                format_row(out_rows[quad_end * row_len..].as_mut_ptr(),
+                                           data.as_ptr().add(src_off), off, width, core, &core.full);
+                                format_row(out_rows[(quad_end + 1) * row_len..].as_mut_ptr(),
+                                           data.as_ptr().add(src_off + 16), off.wrapping_add(16), width, core, &core.full);
+                            }
+                        }
+                    }
+                    if rows & 1 != 0 {
+                        let i = rows - 1;
+                        let src_off = (row_cursor + i) * width;
+                        let off = start_off.wrapping_add(src_off as u64);
+                        unsafe {
+                            format_row(out_rows[i * row_len..].as_mut_ptr(),
+                                       data.as_ptr().add(src_off), off, width, core, &core.full);
+                        }
+                    }
+                } else if use_pairs {
+                    let last_off = start_off.wrapping_add(((row_cursor + rows - 1) * width) as u64);
+                    let fast_all = core.opts.border == BorderStyle::None
+                        && !core.opts.no_position
+                        && !core.opts.offset_dec
+                        && last_off.wrapping_add(48) <= 0xFFFF_FFFF;
+                    let lut = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+                    let even = rows & !1;
+                    let run_pairs = even / 8;
+                    let run_end = run_pairs * 8;
+                    if fast_all && core.full.fast.is_some() {
+                        let k = core.full.fast.as_ref().unwrap();
+                        out_rows[..run_end * row_len]
+                            .par_chunks_mut(row_len * 8)
+                            .enumerate()
+                            .for_each(|(i, block)| {
+                                let src_off = (row_cursor + i * 8) * width;
+                                let off = start_off.wrapping_add(src_off as u64);
+                                unsafe {
+                                    format_pairs_fast_run(block.as_mut_ptr(), data.as_ptr().add(src_off),
+                                                          off, 4, lut, k, row_len);
+                                }
+                            });
+                        if even > run_end {
+                            let src_off = (row_cursor + run_end) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_pairs_fast_run(out_rows[run_end * row_len..].as_mut_ptr(), data.as_ptr().add(src_off),
+                                                      off, (even - run_end) / 2, lut, k, row_len);
+                            }
+                        }
+                        if rows & 1 != 0 {
+                            let i = rows - 1;
+                            let src_off = (row_cursor + i) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_row(out_rows[i * row_len..].as_mut_ptr(),
+                                           data.as_ptr().add(src_off), off, width, core, &core.full);
+                            }
+                        }
+                    } else {
+                        let (idx, sp) = pair_masks(&core.full);
+                        out_rows[..run_end * row_len]
+                            .par_chunks_mut(row_len * 8)
+                            .enumerate()
+                            .for_each(|(i, block)| {
+                                let src_off = (row_cursor + i * 8) * width;
+                                let off = start_off.wrapping_add(src_off as u64);
+                                unsafe {
+                                    format_pairs_run(block.as_mut_ptr(), data.as_ptr().add(src_off),
+                                                     off, 4, &idx, &sp, fast_all, lut, core, &core.full, row_len);
+                                }
+                            });
+                        if even > run_end {
+                            let src_off = (row_cursor + run_end) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_pairs_run(out_rows[run_end * row_len..].as_mut_ptr(), data.as_ptr().add(src_off),
+                                                 off, (even - run_end) / 2, &idx, &sp, fast_all, lut, core, &core.full, row_len);
+                            }
+                        }
+                        if rows & 1 != 0 {
+                            let i = rows - 1;
+                            let src_off = (row_cursor + i) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_row(out_rows[i * row_len..].as_mut_ptr(),
+                                           data.as_ptr().add(src_off), off, width, core, &core.full);
+                            }
+                        }
+                    }
+                } else {
+                    out_rows
+                        .par_chunks_mut(row_len)
+                        .enumerate()
+                        .for_each(|(i, row)| {
+                            let src_off = (row_cursor + i) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            let src_ptr;
+                            let mut tmp;
+                            if src_off + blocks * 16 <= file_sz {
+                                src_ptr = unsafe { data.as_ptr().add(src_off) };
+                            } else {
+                                tmp = vec![0u8; blocks * 16];
+                                tmp[..width].copy_from_slice(&data[src_off..src_off + width]);
+                                src_ptr = tmp.as_ptr();
+                            }
+                            unsafe {
+                                format_row(row.as_mut_ptr(), src_ptr, off, width, core, &core.full);
+                            }
+                        });
                 }
             }
+            chunk_out.truncate(payload);
+            send_data.send(chunk_out).unwrap();
+            row_cursor += rows;
         }
-
-        let mut chunk_out = recv_free.recv().unwrap();
-        chunk_out.resize(rows * orb, 0);
-
-        if use_avx2 {
-            let even = rows & !1;
-            chunk_out[..even * orb]
-                .par_chunks_mut(orb * 2)
-                .enumerate()
-                .for_each(|(i, two_rows)| {
-                    let src_off = (row_cursor + i * 2) * bpr;
-                    let off = start_off.wrapping_add(src_off as u64);
-                    unsafe {
-                        format_two_rows_avx2(two_rows.as_mut_ptr(), data.as_ptr().add(src_off), off, off_len_simd);
-                    }
-                });
-            if rows & 1 != 0 {
-                let src_off = (row_cursor + rows - 1) * bpr;
-                let off = start_off.wrapping_add(src_off as u64);
-                unsafe {
-                    format_row_simd(chunk_out[(rows-1)*orb..].as_mut_ptr(),
-                                    data.as_ptr().add(src_off), off, off_len_simd);
-                }
-            }
-        } else if use_simd {
-            chunk_out
-                .par_chunks_mut(orb)
-                .enumerate()
-                .for_each(|(i, row)| {
-                    let src_off = (row_cursor + i) * bpr;
-                    let off = start_off.wrapping_add(src_off as u64);
-                    unsafe {
-                        format_row_simd(row.as_mut_ptr(), data.as_ptr().add(src_off), off, off_len_simd);
-                    }
-                });
-        } else {
-            // scalar parallel (non-16-width or no SIMD)
-            chunk_out
-                .par_chunks_mut(orb)
-                .enumerate()
-                .for_each(|(i, row)| {
-                    let src_off = (row_cursor + i) * bpr;
-                    let off = start_off.wrapping_add(src_off as u64);
-                    let mut v = Vec::with_capacity(orb);
-                    format_canonical_scalar(&mut v, &data[src_off..src_off+bpr], off);
-                    row[..v.len().min(orb)].copy_from_slice(&v[..v.len().min(orb)]);
-                });
-        }
-
-        send_data.send(chunk_out).unwrap();
-        row_cursor += rows;
     }
 
     drop(send_data);
     writer.join().unwrap()?;
 
-    // Tail row (partial) must come before the final offset line
+    let mut so = io::stdout().lock();
     if tail_len > 0 {
-        let src_off = full_rows * bpr;
+        let src_off = full_rows * width;
         let off     = start_off.wrapping_add(src_off as u64);
-        let mut v   = Vec::with_capacity(orb);
-        format_canonical_scalar(&mut v, &data[src_off..], off);
-        io::stdout().lock().write_all(&v)?;
+        let mut tmp = vec![0u8; blocks * 16];
+        tmp[..tail_len].copy_from_slice(&data[src_off..]);
+        let layout = cfg.layout(tail_len);
+        let cap = core.prefix_len(field_len_at(full_rows)) + layout.emitted + 16;
+        let mut v = vec![0u8; cap];
+        let n = unsafe { format_row(v.as_mut_ptr(), tmp.as_ptr(), off, tail_len, core, layout) };
+        so.write_all(&v[..n])?;
     }
 
-    // Final offset line (like xxd: always printed at the end)
-    {
+    if opts.border != BorderStyle::None {
+        border_bottom(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+    } else if !opts.no_position {
         let final_off = start_off.wrapping_add(file_sz as u64);
-        let mut tmp   = [0u8; 20];
-        let olen      = write_offset(&mut tmp, final_off, false, false);
-        io::stdout().lock().write_all(&tmp[..olen])?;
-        io::stdout().lock().write_all(b"\n")?;
+        let mut tmp = [0u8; 20];
+        let olen = write_offset(&mut tmp, final_off, opts.offset_dec, opts.uppercase);
+        so.write_all(&tmp[..olen])?;
+        so.write_all(b"\n")?;
     }
 
-    Ok(())
-}
-
-/// Minimal canonical scalar formatter for the parallel path (no opts dependency).
-fn format_canonical_scalar(dst: &mut Vec<u8>, src: &[u8], off: u64) {
-    let n     = src.len();
-    let width = 16; // Always 16 for canonical
-    let half  = width / 2;
-    let mut tmp = [0u8; 20]; // enough for up to 16 hex digits
-    let olen = write_offset(&mut tmp, off, false, false);
-    dst.extend_from_slice(&tmp[..olen]);
-    dst.push(b':');
-    dst.push(b' ');
-    for i in 0..width {
-        if i > 0 && i % half == 0 { dst.push(b' '); }
-        if i < n {
-            let b = src[i];
-            dst.push(HEX_LOWER[(b >> 4) as usize]);
-            dst.push(HEX_LOWER[(b & 0xf) as usize]);
-            dst.push(b' ');
-        } else { dst.push(b' '); dst.push(b' '); dst.push(b' '); }
-    }
-    dst.push(b'|');
-    for i in 0..n {
-        let b = src[i];
-        dst.push(if b >= 0x20 && b <= 0x7e { b } else { b'.' });
-    }
-    for _ in n..width {
-        dst.push(b' ');
-    }
-    dst.push(b'|');
-    dst.push(b'\n');
+    so.flush()
 }
 
 fn run_serial_mmap(
@@ -2093,8 +3050,20 @@ fn run_serial_mmap(
     let mut squeezed            = false;
     let mut lines_written: u64  = 0;
     let simd_ok                 = is_simd_eligible(opts, do_color);
+    let full_kind = if old_simd_eligible(opts) { LayoutKind::Generic } else { LayoutKind::OutputLine };
+    let cfg                     = if simd_ok && use_simd {
+        Some(RowCfg::new(opts, full_kind, LayoutKind::OutputLine))
+    } else { None };
+    let core                    = cfg.as_ref().map(|c| &c.core);
+    let max_field               = field_len_for(opts, start_off.wrapping_add(file_sz as u64));
+    let row_cap                 = core.map_or(16, |c| (c.prefix_len(max_field) + c.full.emitted) * 2 + 32);
+    let mut row_buf             = vec![0u8; row_cap];
+    let mut scratch             = vec![0u8; core.map_or(0, |c| c.blocks * 16).max(32)];
+    let pair_ok                 = core.map_or(false, can_pair)
+        && !opts.squeeze && opts.max_lines.is_none();
 
-    for r in 0..full_rows {
+    let mut r = 0usize;
+    while r < full_rows {
         if opts.max_lines.map_or(false, |m| lines_written >= m) { break; }
 
         let src_off    = r * bpr;
@@ -2104,27 +3073,51 @@ fn run_serial_mmap(
         // Squeeze
         if opts.squeeze && row_data == prev_row.as_slice() {
             if !squeezed { out.write_all(b"*\n")?; squeezed = true; if opts.max_lines.is_some() { lines_written += 1; } }
+            r += 1;
             continue;
         }
         if opts.squeeze { squeezed = false; prev_row.clear(); prev_row.extend_from_slice(row_data); }
 
-        // Fast SIMD path for canonical no-color
-        if simd_ok && use_simd && opts.border == BorderStyle::None {
-            let off_len   = offset_len(disp_off);
-            let row_bytes = off_len + 71; // 78 for <4GiB, 79 for >=4GiB
-            let mut row   = [0u8; 88];   // 16 hex digits + 71 = 87 max possible
-            unsafe { format_row_simd(row.as_mut_ptr(), row_data.as_ptr(), disp_off, off_len); }
-            out.write_all(&row[..row_bytes])?;
+        if let Some(core) = core {
+            if pair_ok && r + 1 < full_rows {
+                let row_len = core.prefix_len(field_len_for(opts, disp_off)) + core.full.emitted;
+                let src_ptr = if src_off + 32 <= file_sz {
+                    row_data.as_ptr()
+                } else {
+                    scratch[..32].copy_from_slice(&data[src_off..src_off + 32]);
+                    scratch.as_ptr()
+                };
+                let n = unsafe { format_two_rows(row_buf.as_mut_ptr(), src_ptr, disp_off, core, &core.full, row_len) };
+                out.write_all(&row_buf[..n])?;
+                r += 2;
+                continue;
+            }
+            let src_ptr = if src_off + core.blocks * 16 <= file_sz {
+                row_data.as_ptr()
+            } else {
+                scratch[..bpr].copy_from_slice(row_data);
+                scratch.as_ptr()
+            };
+            let n = unsafe { format_row(row_buf.as_mut_ptr(), src_ptr, disp_off, bpr, core, &core.full) };
+            out.write_all(&row_buf[..n])?;
         } else {
             output_line(&mut out, row_data, disp_off, opts, do_color, hex_w, ascii_w)?;
         }
         if opts.max_lines.is_some() { lines_written += 1; }
+        r += 1;
     }
 
     if tail_len > 0 && opts.max_lines.map_or(true, |m| lines_written < m) {
         let src_off  = full_rows * bpr;
         let disp_off = start_off.wrapping_add(src_off as u64);
-        output_line(&mut out, &data[src_off..], disp_off, opts, do_color, hex_w, ascii_w)?;
+        if let (Some(core), Some(cfg)) = (core, cfg.as_ref()) {
+            scratch[..tail_len].copy_from_slice(&data[src_off..]);
+            let layout = cfg.layout(tail_len);
+            let n = unsafe { format_row(row_buf.as_mut_ptr(), scratch.as_ptr(), disp_off, tail_len, core, layout) };
+            out.write_all(&row_buf[..n])?;
+        } else {
+            output_line(&mut out, &data[src_off..], disp_off, opts, do_color, hex_w, ascii_w)?;
+        }
     }
 
     if opts.border != BorderStyle::None {
@@ -2177,6 +3170,20 @@ fn run_streaming(
     }
 
     let simd_eligible = is_simd_eligible(opts, do_color) && use_simd;
+    let cfg = if simd_eligible {
+        let kind = |tail: bool| {
+            if old_simd_eligible(opts) {
+                if tail { LayoutKind::Scalar } else { LayoutKind::Generic }
+            } else if opts.border != BorderStyle::None {
+                LayoutKind::OutputLine
+            } else {
+                LayoutKind::Generic
+            }
+        };
+        Some(RowCfg::new(opts, kind(false), kind(true)))
+    } else { None };
+    let core = cfg.as_ref().map(|c| &c.core);
+    let mut row_tmp = vec![0u8; core.map_or(0, |c| c.blocks * 16).max(32)];
     let mut prev_row: Vec<u8> = Vec::new();
     let mut squeezed          = false;
     let mut lines_written: u64 = 0;
@@ -2220,7 +3227,10 @@ fn run_streaming(
             &rbuf[..n]
         };
 
-        for r in 0..full_rows {
+        let pair_ok = simd_eligible && !opts.squeeze
+            && opts.max_lines.is_none() && can_pair(core.unwrap());
+        let mut r = 0usize;
+        while r < full_rows {
             if opts.max_lines.map_or(false, |m| lines_written >= m) { break; }
             let src = &combined[r * bpr..(r + 1) * bpr];
 
@@ -2232,17 +3242,39 @@ fn run_streaming(
                     squeezed = true;
                 }
                 offset = offset.wrapping_add(bpr as u64);
+                r += 1;
                 continue;
             }
             if opts.squeeze { squeezed = false; prev_row.clear(); prev_row.extend_from_slice(src); }
 
             if simd_eligible {
-                let off_len   = offset_len(offset);
-                let row_bytes = off_len + 71;
-                if wpos + row_bytes > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
-                unsafe { format_row_simd(wbuf[wpos..].as_mut_ptr(), src.as_ptr(), offset, off_len); }
-                wpos += row_bytes;
-            } else if do_color || opts.border != BorderStyle::None {
+                let core = core.unwrap();
+                if pair_ok && r + 1 < full_rows {
+                    let row_len = core.prefix_len(field_len_for(opts, offset)) + core.full.emitted;
+                    if wpos + row_len * 2 + 16 > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
+                    let src_ptr = if r * bpr + 32 <= combined.len() {
+                        src.as_ptr()
+                    } else {
+                        row_tmp[..32].copy_from_slice(&combined[r * bpr..r * bpr + 32]);
+                        row_tmp.as_ptr()
+                    };
+                    unsafe { format_two_rows(wbuf[wpos..].as_mut_ptr(), src_ptr, offset, core, &core.full, row_len); }
+                    wpos += row_len * 2;
+                    offset = offset.wrapping_add((2 * bpr) as u64);
+                    r += 2;
+                    continue;
+                }
+                let row_len = core.prefix_len(field_len_for(opts, offset)) + core.full.emitted;
+                if wpos + row_len + 16 > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
+                let src_ptr = if r * bpr + core.blocks * 16 <= combined.len() {
+                    src.as_ptr()
+                } else {
+                    row_tmp[..bpr].copy_from_slice(src);
+                    row_tmp.as_ptr()
+                };
+                let n = unsafe { format_row(wbuf[wpos..].as_mut_ptr(), src_ptr, offset, bpr, core, &core.full) };
+                wpos += n;
+            } else if do_color {
                 if wpos > 0 { out.write_all(&wbuf[..wpos])?; wpos = 0; }
                 output_line(&mut out, src, offset, opts, do_color, hex_w, ascii_w)?;
             } else {
@@ -2254,6 +3286,7 @@ fn run_streaming(
             }
             if opts.max_lines.is_some() { lines_written += 1; }
             offset = offset.wrapping_add(bpr as u64);
+            r += 1;
         }
 
         // Save tail into carry
@@ -2267,13 +3300,14 @@ fn run_streaming(
     if carry_len > 0 && opts.max_lines.map_or(true, |m| lines_written < m) {
         let src = &carry[..carry_len];
         if simd_eligible {
-            // partial row: use scalar
-            let mut tmp = Vec::with_capacity(128);
-            format_canonical_scalar(&mut tmp, src, offset);
-            if wpos + tmp.len() > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
-            wbuf[wpos..wpos+tmp.len()].copy_from_slice(&tmp);
-            wpos += tmp.len();
-        } else if do_color || opts.border != BorderStyle::None {
+            let core = core.unwrap();
+            let row_len = core.prefix_len(field_len_for(opts, offset)) + core.full.emitted;
+            if wpos + row_len + 16 > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
+            row_tmp[..carry_len].copy_from_slice(src);
+            let layout = cfg.as_ref().unwrap().layout(carry_len);
+            let n = unsafe { format_row(wbuf[wpos..].as_mut_ptr(), row_tmp.as_ptr(), offset, carry_len, core, layout) };
+            wpos += n;
+        } else if do_color {
             if wpos > 0 { out.write_all(&wbuf[..wpos])?; wpos = 0; }
             output_line(&mut out, src, offset, opts, do_color, hex_w, ascii_w)?;
         } else {
