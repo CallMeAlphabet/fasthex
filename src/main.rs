@@ -12,7 +12,7 @@
 //! See the License for the specific language governing permissions and
 //! limitations under the License.
 
-//! fasthex 0.3.1 – a very fast hex dumper
+//! fasthex 0.3.5 – a very fast hex dumper
 //!
 //! Speed notes:
 //!   1. mmap + rayon parallel formatting in 64 MiB chunks.
@@ -138,6 +138,7 @@ struct Options {
     endian:       Endian,
     border:       BorderStyle,
     no_ascii:     bool,
+    minimal:      bool,
     no_position:  bool,
     skip:         i64,          // signed: negative = from end
     length:       Option<u64>,
@@ -168,6 +169,7 @@ impl Default for Options {
             endian:       Endian::Big,
             border:       BorderStyle::None,
             no_ascii:     false,
+            minimal:      false,
             no_position:  false,
             skip:         0,
             length:       None,
@@ -225,6 +227,7 @@ fn layout_rows() -> Vec<Row> {
         row_val("-B", "--border", "<STYLE>", "none | ascii | unicode  (default: none)"),
         row("-A", "--no-ascii", "hide the ASCII panel"),
         row("-P", "--no-position", "hide the offset/position column"),
+        row("", "--minimal", "compact rows: offset + hex + ascii, no separators"),
     ]
 }
 
@@ -289,7 +292,7 @@ fn print_help() {
 }
 
 pub fn print_help_body(on: bool) {
-    let mut page = HelpPage::new("fasthex 0.3.1 - a very fast hex dumper")
+    let mut page = HelpPage::new("fasthex 0.3.5 - a very fast hex dumper")
         .usage("fasthex [options] [file]...")
         .usage("fasthex -r [options] [file] [-j <offset>]")
         .usage("fasthex [options] -          read from stdin explicitly")
@@ -371,7 +374,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
 
             match key {
                 "help"    => { print_help(); std::process::exit(0); }
-                "version" => { println!("0.3.1"); std::process::exit(0); }
+                "version" => { println!("0.3.5"); std::process::exit(0); }
                 "hex"           => opts.mode = DisplayMode::OneByteHex,
                 "hex-wide"      => opts.mode = DisplayMode::TwoByteHex,
                 "octal"         => opts.mode = DisplayMode::OneByteOctal,
@@ -384,6 +387,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
                 "include"       => opts.mode = DisplayMode::CInclude,
                 "reverse"       => opts.mode = DisplayMode::Reverse,
                 "no-ascii"      => opts.no_ascii = true,
+                "minimal"       => opts.minimal = true,
                 "no-position"   => opts.no_position = true,
                 "uppercase"     => opts.uppercase = true,
                 "offset-dec"    => opts.offset_dec = true,
@@ -470,7 +474,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
             while j < bytes.len() {
                 match bytes[j] {
                     b'h' => { print_help(); std::process::exit(0); }
-                    b'v' => { println!("0.3.1"); std::process::exit(0); }
+                    b'v' => { println!("0.3.5"); std::process::exit(0); }
                     b'x' => opts.mode = DisplayMode::OneByteHex,
                     b'X' => opts.mode = DisplayMode::TwoByteHex,
                     b'o' => opts.mode = DisplayMode::OneByteOctal,
@@ -724,6 +728,12 @@ struct ZeroCopyWriter {
 
 impl ZeroCopyWriter {
     fn new() -> io::Result<Self> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let ok = unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) == 0 };
+        let mode = if ok { st.st_mode & libc::S_IFMT } else { 0 };
+        if mode != libc::S_IFREG && mode != libc::S_IFIFO {
+            return Ok(Self { pipe_r: -1, pipe_w: -1, stdout: libc::STDOUT_FILENO, fallback: true });
+        }
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error());
@@ -814,9 +824,11 @@ impl Drop for ZeroCopyWriter {
 }
 
 struct HexWin {
-    off: usize,
-    idx: [i8; 16],
-    sp:  [u8; 16],
+    off:   usize,
+    idx:   [i8; 16],
+    sp:    [u8; 16],
+    hi:    bool,
+    block: usize,
 }
 
 struct ConstBlock {
@@ -825,15 +837,29 @@ struct ConstBlock {
     val: u64,
 }
 
+#[derive(Clone, Copy)]
 struct CanonKernel {
-    idx_a:  [[i8; 16]; 3],
-    idx_b:  [[i8; 16]; 3],
-    sp:     [[u8; 16]; 3],
-    t0_idx: [i8; 16],
-    t0_sp:  [u8; 16],
-    t1_idx: [i8; 16],
-    t1_sp:  [u8; 16],
-    tail:   (usize, u16),
+    idx_a:    [[i8; 16]; 3],
+    idx_b:    [[i8; 16]; 3],
+    sp:       [[u8; 16]; 3],
+    w3_idx:   [i8; 16],
+    w3_sp:    [u8; 16],
+    tu_idx:   [i8; 16],
+    tu_sp:    [u8; 16],
+    nl:       u8,
+    has_ascii: bool,
+    emitted:  usize,
+}
+
+struct ColoredWin {
+    idx_c:  [[i8; 16]; 5],
+    idx_ch: [i8; 16],
+    sp:     [u8; 16],
+}
+
+struct ColoredPanel {
+    panel_off: usize,
+    wins:      [ColoredWin; 10],
 }
 
 struct RowLayout {
@@ -846,6 +872,7 @@ struct RowLayout {
     consts:        Vec<ConstBlock>,
     all_fit:       bool,
     fast:          Option<CanonKernel>,
+    colored:       Option<ColoredPanel>,
 }
 
 #[inline(always)]
@@ -870,6 +897,7 @@ struct RowCore {
     full:                 RowLayout,
     rev:                  Option<[i8; 16]>,
     tail_kind:            LayoutKind,
+    do_color:             bool,
 }
 
 struct RowCfg {
@@ -936,8 +964,9 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
     let mut r2 = Vec::new();
     match kind {
         LayoutKind::OutputLine if !output_line_diverts(opts) => {
-            output_line(&mut r1, &vec![0x55; n], 0, &derive_opts, false, 0, 0).unwrap();
-            output_line(&mut r2, &vec![0xAA; n], 1, &derive_opts, false, 0, 0).unwrap();
+            let dc = use_color(opts);
+            output_line(&mut r1, &vec![0x55; n], 0, &derive_opts, dc, 0, 0).unwrap();
+            output_line(&mut r2, &vec![0xAA; n], 1, &derive_opts, dc, 0, 0).unwrap();
         }
         LayoutKind::Scalar => {
             format_scalar_row(&mut r1, &vec![0x55; n], 0, opts.no_ascii);
@@ -959,7 +988,7 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
     } else if opts.no_position {
         0
     } else {
-        field_len_for(opts, 0) + 2
+        field_len_for(opts, 0) + if opts.minimal { 1 } else if use_color(opts) { 11 } else { 2 }
     };
     let mut suffix = r1[prefix_len..].to_vec();
     for i in 0..suffix.len() {
@@ -981,10 +1010,13 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
     let mut hex_pairs: Vec<(usize, usize)> = Vec::new();
     let mut tail_runs: Vec<(usize, usize)> = Vec::new();
     for &(s, l) in &runs {
-        if l == 2 && hex_pairs.len() < n {
-            hex_pairs.push((s, s + 1));
-        } else {
-            tail_runs.push((s, l));
+        let mut consumed = 0usize;
+        while consumed + 1 < l && hex_pairs.len() < n {
+            hex_pairs.push((s + consumed, s + consumed + 1));
+            consumed += 2;
+        }
+        if consumed < l {
+            tail_runs.push((s + consumed, l - consumed));
         }
     }
     let mut ascii_off = 0usize;
@@ -1006,21 +1038,69 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
             }
         }
     }
+    let colored_ok = use_color(opts)
+        && opts.scheme == ColorScheme::Default
+        && opts.table == CharTable::Ascii
+        && !opts.no_ascii
+        && opts.border == BorderStyle::None
+        && opts.mode == DisplayMode::Canonical;
+    let mut colored = None;
+    if colored_ok && hex_pairs.len() == n && !hex_pairs.is_empty() && !tail_runs.is_empty()
+        && tail_runs[0].0 >= 2 {
+        let panel_off = tail_runs[0].0 - 2;
+        let mut wins: [ColoredWin; 10] = std::array::from_fn(|_| ColoredWin {
+            idx_c: [[-1i8; 16]; 5],
+            idx_ch: [-1i8; 16],
+            sp: [0u8; 16],
+        });
+        const RESET: [u8; 4] = [0x1b, 0x5b, 0x30, 0x6d];
+        for w in 0..10 {
+            for k in 0..16 {
+                let ppos = w * 16 + k;
+                let j = ppos / 10;
+                let c = ppos % 10;
+                if j < n {
+                    if c < 5 {
+                        wins[w].idx_c[c][k] = j as i8;
+                    } else if c == 5 {
+                        wins[w].idx_ch[k] = j as i8;
+                    } else {
+                        wins[w].sp[k] = RESET[c - 6];
+                    }
+                } else {
+                    wins[w].sp[k] = b' ';
+                }
+            }
+        }
+        let end = panel_off + n * 10;
+        if suffix.len() < end {
+            suffix.resize(end, b' ');
+        }
+        colored = Some(ColoredPanel { panel_off, wins });
+    }
     let build_windows = |pairs: &[(usize, usize)], suffix: &[u8]| -> Vec<HexWin> {
         let mut out = Vec::new();
         let npairs = pairs.len();
-        for q0 in (0..npairs).step_by(4) {
+        let mut q0 = 0usize;
+        while q0 < npairs {
             let start = pairs[q0].0;
+            let half = (q0 % 16) / 8;
+            let mut q1 = q0;
+            while q1 + 1 < npairs && (q1 + 1) / 16 == q0 / 16
+                && ((q1 + 1) % 16) / 8 == half
+                && pairs[q1 + 1].1 + 1 - start <= 16 {
+                q1 += 1;
+            }
             let mut idx = [-1i8; 16];
             let mut sp = [0u8; 16];
             for k in 0..16 {
                 let pos = start + k;
                 let mut hit = None;
-                for j in q0..(q0 + 4).min(npairs) {
+                for j in q0..=q1 {
                     for c in 0..2 {
                         let slot = if c == 0 { pairs[j].0 } else { pairs[j].1 };
                         if slot == pos {
-                            hit = Some(((j - q0) * 2 + c + ((q0 / 4) & 1) * 8) as i8);
+                            hit = Some((2 * (j % 8) + c) as i8);
                         }
                     }
                 }
@@ -1029,7 +1109,8 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
                     None => sp[k] = if pos < suffix.len() { suffix[pos] } else { b' ' },
                 }
             }
-            out.push(HexWin { off: start, idx, sp });
+            out.push(HexWin { off: start, idx, sp, hi: half == 1, block: q0 / 16 });
+            q0 = q1 + 1;
         }
         out
     };
@@ -1047,6 +1128,9 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
     }
     if opts.table == CharTable::Ascii {
         for k in ascii_off..(ascii_off + ascii_run).min(emitted) { covered[k] = true; }
+    }
+    if let Some(cp) = &colored {
+        for k in cp.panel_off..(cp.panel_off + n * 10).min(emitted) { covered[k] = true; }
     }
     let mut consts: Vec<ConstBlock> = Vec::new();
     let mut i = 0;
@@ -1071,16 +1155,27 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
     }
     let all_fit = windows.iter().all(|w| w.off + 16 <= emitted)
         && ascii_windows.iter().all(|w| w.off + 16 <= emitted);
-    let fast = if opts.width == 16 && opts.table == CharTable::Ascii && opts.endian == Endian::Big {
+    let canonical_shape = opts.mode == DisplayMode::Canonical
+        && opts.width == 16
+        && (ascii_run >= 16 || (opts.no_ascii && ascii_run == 0))
+        && hex_pairs.len() == 16
+        && (0..16).all(|j| {
+            let o = if j >= 8 { 1 } else { 0 };
+            hex_pairs[j] == (3 * j + o, 3 * j + 1 + o)
+        });
+    let fast = if canonical_shape && opts.table == CharTable::Ascii && opts.endian == Endian::Big
+        && opts.border == BorderStyle::None && colored.is_none() {
         let mut k = CanonKernel {
-            idx_a:  [[-1i8; 16]; 3],
-            idx_b:  [[-1i8; 16]; 3],
-            sp:     [[0u8; 16]; 3],
-            t0_idx: [-1i8; 16],
-            t0_sp:  [0u8; 16],
-            t1_idx: [-1i8; 16],
-            t1_sp:  [0u8; 16],
-            tail:   (0, 0),
+            idx_a:    [[-1i8; 16]; 3],
+            idx_b:    [[-1i8; 16]; 3],
+            sp:       [[0u8; 16]; 3],
+            w3_idx:   [-1i8; 16],
+            w3_sp:    [0u8; 16],
+            tu_idx:   [-1i8; 16],
+            tu_sp:    [0u8; 16],
+            nl:       0,
+            has_ascii: false,
+            emitted:   0,
         };
         let mut ok = true;
         for (bi, base) in [0usize, 16, 32].iter().enumerate() {
@@ -1089,43 +1184,53 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
                 if let Some(ci) = hex_pairs.iter().position(|&(a, b)| a == pos || b == pos) {
                     let c = if hex_pairs[ci].0 == pos { 2 * ci } else { 2 * ci + 1 };
                     if c < 16 { k.idx_a[bi][kk] = c as i8; } else { k.idx_b[bi][kk] = (c - 16) as i8; }
-                } else if pos < suffix.len() && suffix[pos] != 0xFF {
-                    k.sp[bi][kk] = suffix[pos];
-                } else {
-                    ok = false;
+                } else if pos < suffix.len() {
+                    if suffix[pos] != 0xFF { k.sp[bi][kk] = suffix[pos]; } else { ok = false; }
                 }
             }
         }
-        if emitted >= 68 {
+        k.emitted = emitted;
+        k.has_ascii = ascii_run >= 16;
+        if k.has_ascii {
+            if emitted >= 69 {
+                for kk in 0..16 {
+                    let pos = 48 + kk;
+                    if pos >= ascii_off && pos < ascii_off + ascii_run && pos - ascii_off < 16 {
+                        k.w3_idx[kk] = (pos - ascii_off) as i8;
+                    } else if pos < suffix.len() && suffix[pos] != 0xFF {
+                        k.w3_sp[kk] = suffix[pos];
+                    } else {
+                        ok = false;
+                    }
+                }
+                for kk in 0..4 {
+                    let pos = 64 + kk;
+                    if pos >= ascii_off && pos < ascii_off + ascii_run && pos - ascii_off < 16 {
+                        k.tu_idx[kk] = (pos - ascii_off) as i8;
+                    } else if pos < suffix.len() && suffix[pos] != 0xFF {
+                        k.tu_sp[kk] = suffix[pos];
+                    } else {
+                        ok = false;
+                    }
+                }
+                k.nl = suffix[68];
+            } else {
+                ok = false;
+            }
+        } else if emitted >= 48 {
             for kk in 0..16 {
                 let pos = 48 + kk;
-                if pos >= ascii_off && pos < ascii_off + ascii_run && pos - ascii_off < 16 {
-                    k.t0_idx[kk] = (pos - ascii_off) as i8;
-                } else if pos < suffix.len() && suffix[pos] != 0xFF {
-                    k.t0_sp[kk] = suffix[pos];
-                } else {
-                    ok = false;
-                }
-            }
-            for kk in 0..4 {
-                let pos = 64 + kk;
-                if pos >= ascii_off && pos < ascii_off + ascii_run && pos - ascii_off < 16 {
-                    k.t1_idx[kk] = (pos - ascii_off) as i8;
-                } else if pos < suffix.len() && suffix[pos] != 0xFF {
-                    k.t1_sp[kk] = suffix[pos];
-                } else {
-                    ok = false;
+                if pos < suffix.len() {
+                    if suffix[pos] != 0xFF { k.w3_sp[kk] = suffix[pos]; } else { ok = false; }
                 }
             }
         } else {
             ok = false;
         }
-        if ok && consts.len() == 1 && consts[0].len == 2 {
-            k.tail = (consts[0].off, consts[0].val as u16);
-            Some(k)
-        } else { None }
+        if ok { Some(k) } else { None }
     } else { None };
-    let esc_mask = if opts.endian == Endian::Little && opts.group > 1 {
+    let esc_mask = if opts.endian == Endian::Little && opts.group > 1
+        && opts.mode == DisplayMode::Canonical {
         let g = opts.group;
         let rem = n % g;
         if rem != 0 {
@@ -1141,7 +1246,7 @@ fn build_layout(opts: &Options, n: usize, kind: LayoutKind) -> RowLayout {
             Some(m)
         } else { None }
     } else { None };
-    RowLayout { emitted, windows, ascii_windows, ascii_off, ascii_run, esc_mask, consts, all_fit, fast }
+    RowLayout { emitted, windows, ascii_windows, ascii_off, ascii_run, esc_mask, consts, all_fit, fast, colored }
 }
 
 impl RowCfg {
@@ -1162,19 +1267,28 @@ impl RowCfg {
         let prefix_fixed = if fixed_prefix {
             bar_len + if opts.no_position { 0 } else { pos_w }
         } else { 0 };
-        let rev = if opts.endian == Endian::Little && opts.group > 1 {
-            let g = opts.group;
-            let mut m = [0i8; 16];
-            for j in 0..16 {
-                m[j] = ((j / g) * g + (g - 1 - j % g)) as i8;
+        let rev = if opts.endian == Endian::Little {
+            let g = match opts.mode {
+                DisplayMode::TwoByteHex => opts.group.max(2),
+                _ => opts.group,
+            };
+            if opts.mode == DisplayMode::Canonical && g <= 1 {
+                None
+            } else if opts.mode != DisplayMode::Canonical && opts.mode != DisplayMode::TwoByteHex {
+                None
+            } else {
+                let mut m = [0i8; 16];
+                for j in 0..16 {
+                    m[j] = ((j / g) * g + (g - 1 - j % g)) as i8;
+                }
+                Some(m)
             }
-            Some(m)
         } else { None };
         RowCfg {
             core: RowCore {
                 opts: opts.clone(), width, blocks,
                 fixed_prefix, prefix_fixed, pos_w, bar, bar_len, full, rev,
-                tail_kind,
+                tail_kind, do_color: use_color(opts),
             },
             tails: RefCell::new(HashMap::new()),
         }
@@ -1193,7 +1307,9 @@ impl RowCfg {
 
 impl RowCore {
     fn prefix_len(&self, field_len: usize) -> usize {
-        if self.fixed_prefix { self.prefix_fixed } else { field_len + 2 }
+        if self.fixed_prefix { self.prefix_fixed } else {
+            field_len + if self.opts.minimal { 1 } else if self.do_color { 11 } else { 2 }
+        }
     }
 }
 
@@ -1201,9 +1317,10 @@ fn can_pair(core: &RowCore) -> bool {
     core.width == 16
         && core.rev.is_none()
         && core.full.windows.len() == 4
-        && core.full.ascii_run >= 16
+        && (core.full.ascii_run >= 16 || core.full.fast.is_some())
         && core.full.ascii_windows.is_empty()
         && core.opts.table == CharTable::Ascii
+        && core.full.colored.is_none()
 }
 
 #[target_feature(enable = "sse4.1")]
@@ -1273,17 +1390,45 @@ unsafe fn write_prefix(dst: *mut u8, off: u64, core: &RowCore) -> usize {
             p = p.add(core.bar_len);
         }
     } else if !core.opts.no_position {
-        if core.opts.offset_dec {
-            let mut tmp = [0u8; 20];
-            let olen = write_offset(&mut tmp, off, true, false);
-            std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
-            p = p.add(olen);
+        if core.opts.minimal {
+            if core.opts.offset_dec {
+                let mut tmp = [0u8; 20];
+                let olen = write_offset(&mut tmp, off, true, false);
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+                p = p.add(olen);
+            } else {
+                p = p.add(write_hex_offset(p, off, lut));
+            }
+            *p = b' ';
+            p = p.add(1);
+        } else if core.do_color {
+            std::ptr::copy_nonoverlapping(b"\x1b[36m".as_ptr(), p, 5);
+            p = p.add(5);
+            if core.opts.offset_dec {
+                let mut tmp = [0u8; 20];
+                let olen = write_offset(&mut tmp, off, true, false);
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+                p = p.add(olen);
+            } else {
+                p = p.add(write_hex_offset(p, off, lut));
+            }
+            *p = b':';
+            std::ptr::copy_nonoverlapping(b"\x1b[0m".as_ptr(), p.add(1), 4);
+            *p.add(5) = b' ';
+            p = p.add(6);
         } else {
-            p = p.add(write_hex_offset(p, off, lut));
+            if core.opts.offset_dec {
+                let mut tmp = [0u8; 20];
+                let olen = write_offset(&mut tmp, off, true, false);
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+                p = p.add(olen);
+            } else {
+                p = p.add(write_hex_offset(p, off, lut));
+            }
+            *p = b':';
+            *p.add(1) = b' ';
+            p = p.add(2);
         }
-        *p = b':';
-        *p.add(1) = b' ';
-        p = p.add(2);
     }
     p as usize - dst as usize
 }
@@ -1322,22 +1467,20 @@ unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
         let plo = _mm_unpacklo_epi8(hhi, hlo);
         let phi = _mm_unpackhi_epi8(hhi, hlo);
         if layout.all_fit {
-            for q in 0..4 {
-                let wi = b * 4 + q;
-                if wi >= layout.windows.len() { break; }
+            for wi in 0..layout.windows.len() {
+                if layout.windows[wi].block != b { continue; }
                 let w = &layout.windows[wi];
-                let half = if q < 2 { plo } else { phi };
+                let half = if w.hi { phi } else { plo };
                 let v = _mm_or_si128(
                     _mm_shuffle_epi8(half, _mm_loadu_si128(w.idx.as_ptr() as *const __m128i)),
                     _mm_loadu_si128(w.sp.as_ptr() as *const __m128i));
                 _mm_storeu_si128(p.add(w.off) as *mut __m128i, v);
             }
         } else {
-            for q in 0..4 {
-                let wi = b * 4 + q;
-                if wi >= layout.windows.len() { break; }
+            for wi in 0..layout.windows.len() {
+                if layout.windows[wi].block != b { continue; }
                 let w = &layout.windows[wi];
-                let half = if q < 2 { plo } else { phi };
+                let half = if w.hi { phi } else { plo };
                 let v = _mm_or_si128(
                     _mm_shuffle_epi8(half, _mm_loadu_si128(w.idx.as_ptr() as *const __m128i)),
                     _mm_loadu_si128(w.sp.as_ptr() as *const __m128i));
@@ -1351,6 +1494,43 @@ unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
             }
         }
     }
+    if let Some(cp) = &layout.colored {
+        const GREEN: [u8; 5] = [0x1b, 0x5b, 0x33, 0x32, 0x6d];
+        const DIM: [u8; 5] = [0x1b, 0x5b, 0x39, 0x30, 0x6d];
+        for b in 0..blocks {
+            let raw = _mm_loadu_si128(src.add(b * 16) as *const __m128i);
+            let pr = _mm_and_si128(
+                _mm_cmpgt_epi8(raw, _mm_set1_epi8(0x1f)),
+                _mm_cmpgt_epi8(_mm_set1_epi8(0x7f), raw));
+            let chars = _mm_blendv_epi8(_mm_set1_epi8(b'.' as i8), raw, pr);
+            let mut planes = [_mm_setzero_si128(); 5];
+            for c in 0..5 {
+                planes[c] = _mm_blendv_epi8(
+                    _mm_set1_epi8(DIM[c] as i8), _mm_set1_epi8(GREEN[c] as i8), pr);
+            }
+            let panel_end = cp.panel_off + n * 10;
+            let chars_here = (n - b * 16).min(16);
+            let nwin = (chars_here * 10 + 15) / 16;
+            for w in 0..nwin {
+                let win = &cp.wins[w];
+                let mut v = _mm_loadu_si128(win.sp.as_ptr() as *const __m128i);
+                for c in 0..5 {
+                    v = _mm_or_si128(v, _mm_shuffle_epi8(
+                        planes[c], _mm_loadu_si128(win.idx_c[c].as_ptr() as *const __m128i)));
+                }
+                v = _mm_or_si128(v, _mm_shuffle_epi8(
+                    chars, _mm_loadu_si128(win.idx_ch.as_ptr() as *const __m128i)));
+                let off = cp.panel_off + b * 160 + w * 16;
+                if off + 16 <= panel_end {
+                    _mm_storeu_si128(p.add(off) as *mut __m128i, v);
+                } else {
+                    let mut tmp = [0u8; 16];
+                    _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, v);
+                    std::ptr::copy_nonoverlapping(tmp.as_ptr(), p.add(off), panel_end - off);
+                }
+            }
+        }
+    } else {
     match core.opts.table {
         CharTable::Ascii => {
             let mut done = 0usize;
@@ -1405,6 +1585,7 @@ unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
             }
         }
         _ => {}
+    }
     }
     (p as usize - dst as usize) + layout.emitted
 }
@@ -1596,7 +1777,7 @@ unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
     if fast_off {
         if let Some(k) = &layout.fast {
             let o8 = hex_offsets_4(off, lut);
-            return format_pair_fast(dst, src, [o8[0], o8[1]], k, lut, row_len);
+            return format_pair_fast(dst, src, [o8[0], o8[1]], *k, lut, row_len);
         }
     }
     let (idx, sp) = pair_masks(layout);
@@ -1606,68 +1787,342 @@ unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
     format_pair(dst, src, off, [o8[0], o8[1]], fast_off, &idx, &sp, core, layout, row_len)
 }
 
+macro_rules! hex_offsets4 {
+    ($off:expr, $lutp:expr) => {{
+        let base = _mm_set1_epi32($off as i32);
+        let delta = _mm_setr_epi32(0, 16, 32, 48);
+        let x = _mm_add_epi32(base, delta);
+        let x = _mm_shuffle_epi8(x, _mm_setr_epi8(3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12));
+        let m = _mm_set1_epi8(0x0f);
+        let lo = _mm_and_si128(x, m);
+        let hi = _mm_and_si128(_mm_srli_epi16(x, 4), m);
+        let lutv = _mm_loadu_si128($lutp as *const __m128i);
+        let hlo = _mm_shuffle_epi8(lutv, lo);
+        let hhi = _mm_shuffle_epi8(lutv, hi);
+        let plo = _mm_unpacklo_epi8(hhi, hlo);
+        let phi = _mm_unpackhi_epi8(hhi, hlo);
+        [_mm_cvtsi128_si64(plo) as u64,
+         _mm_cvtsi128_si64(_mm_srli_si128(plo, 8)) as u64,
+         _mm_cvtsi128_si64(phi) as u64,
+         _mm_cvtsi128_si64(_mm_srli_si128(phi, 8)) as u64]
+    }};
+}
+
+static OCT_IDX: [[i8; 16]; 4] = [
+    [-1,0,-1,-1,-1,1,-1,-1,-1,2,-1,-1,-1,3,-1,-1],
+    [-1,4,-1,-1,-1,5,-1,-1,-1,6,-1,-1,-1,7,-1,-1],
+    [-1,8,-1,-1,-1,9,-1,-1,-1,10,-1,-1,-1,11,-1,-1],
+    [-1,12,-1,-1,-1,13,-1,-1,-1,14,-1,-1,-1,15,-1,-1],
+];
+static OCT_IDX1: [[i8; 16]; 4] = [
+    [-1,-1,0,-1,-1,-1,1,-1,-1,-1,2,-1,-1,-1,3,-1],
+    [-1,-1,4,-1,-1,-1,5,-1,-1,-1,6,-1,-1,-1,7,-1],
+    [-1,-1,8,-1,-1,-1,9,-1,-1,-1,10,-1,-1,-1,11,-1],
+    [-1,-1,12,-1,-1,-1,13,-1,-1,-1,14,-1,-1,-1,15,-1],
+];
+static OCT_IDX2: [[i8; 16]; 4] = [
+    [-1,-1,-1,0,-1,-1,-1,1,-1,-1,-1,2,-1,-1,-1,3],
+    [-1,-1,-1,4,-1,-1,-1,5,-1,-1,-1,6,-1,-1,-1,7],
+    [-1,-1,-1,8,-1,-1,-1,9,-1,-1,-1,10,-1,-1,-1,11],
+    [-1,-1,-1,12,-1,-1,-1,13,-1,-1,-1,14,-1,-1,-1,15],
+];
+static OCT_SP: [u8; 16] = [32,0,0,0,32,0,0,0,32,0,0,0,32,0,0,0];
+static OCT_MASK_D0: [u8; 16] = [3,7,3,7,3,7,3,7,3,7,3,7,3,7,3,7];
+
+#[target_feature(enable = "ssse3,sse4.1")]
+unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) {
+    let raw = _mm_loadu_si128(src as *const __m128i);
+    let m7 = _mm_set1_epi8(0x07);
+    let m0d = _mm_loadu_si128(OCT_MASK_D0.as_ptr() as *const __m128i);
+    let d0 = _mm_and_si128(_mm_srli_epi16(raw, 6), m0d);
+    let d1 = _mm_and_si128(_mm_srli_epi16(raw, 3), m7);
+    let d2 = _mm_and_si128(raw, m7);
+    let lut = _mm_loadu_si128(HEX_LOWER.as_ptr() as *const __m128i);
+    let c0 = _mm_shuffle_epi8(lut, d0);
+    let c1 = _mm_shuffle_epi8(lut, d1);
+    let c2 = _mm_shuffle_epi8(lut, d2);
+    std::ptr::write_unaligned(dst as *mut u64, o8);
+    *(dst.add(8) as *mut u16) = 0x203a;
+    let p = dst.add(10);
+    let sp = _mm_loadu_si128(OCT_SP.as_ptr() as *const __m128i);
+    for w in 0..4 {
+        let idx0 = _mm_loadu_si128(OCT_IDX[w].as_ptr() as *const __m128i);
+        let idx1 = _mm_loadu_si128(OCT_IDX1[w].as_ptr() as *const __m128i);
+        let idx2 = _mm_loadu_si128(OCT_IDX2[w].as_ptr() as *const __m128i);
+        let v = _mm_or_si128(_mm_or_si128(
+            _mm_or_si128(_mm_shuffle_epi8(c0, idx0), _mm_shuffle_epi8(c1, idx1)),
+            _mm_shuffle_epi8(c2, idx2)),
+            sp);
+        _mm_storeu_si128(p.add(w * 16) as *mut __m128i, v);
+    }
+    *p.add(64) = b'\n';
+}
+
+#[target_feature(enable = "ssse3,sse4.1")]
+unsafe fn format_octal_run(dst: *mut u8, src: *const u8, off: u64, rows: usize,
+                           upper: bool, row_len: usize) {
+    let mut i = 0;
+    let lut = if upper { HEX_UPPER.as_ptr() } else { HEX_LOWER.as_ptr() };
+    while i + 3 < rows {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 16) as u64), lut);
+        format_row_octal(dst.add(i * row_len), src.add(i * 16), o8[0]);
+        format_row_octal(dst.add((i + 1) * row_len), src.add((i + 1) * 16), o8[1]);
+        format_row_octal(dst.add((i + 2) * row_len), src.add((i + 2) * 16), o8[2]);
+        format_row_octal(dst.add((i + 3) * row_len), src.add((i + 3) * 16), o8[3]);
+        i += 4;
+    }
+    while i < rows {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 16) as u64), lut);
+        format_row_octal(dst.add(i * row_len), src.add(i * 16), o8[0]);
+        i += 1;
+    }
+}
+
+macro_rules! fast_pair_min_body {
+    ($dst:expr, $src:expr, $o0:expr, $o1:expr, $lutp:expr, $has_ascii:expr, $row_len:expr) => {{
+        let raw = _mm256_loadu_si256($src as *const __m256i);
+        let m0f = _mm256_set1_epi8(0x0f);
+        let lo  = _mm256_and_si256(raw, m0f);
+        let hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), m0f);
+        let lutv = _mm256_broadcastsi128_si256(_mm_loadu_si128($lutp as *const __m128i));
+        let hlo = _mm256_shuffle_epi8(lutv, lo);
+        let hhi = _mm256_shuffle_epi8(lutv, hi);
+        let plo = _mm256_unpacklo_epi8(hhi, hlo);
+        let phi = _mm256_unpackhi_epi8(hhi, hlo);
+        let asc = if $has_ascii {
+            let pr = _mm256_and_si256(
+                _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
+            _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr)
+        } else {
+            _mm256_setzero_si256()
+        };
+        let d0 = $dst;
+        std::ptr::write_unaligned(d0 as *mut u64, $o0);
+        *d0.add(8) = b' ';
+        let d1 = d0.add($row_len);
+        std::ptr::write_unaligned(d1 as *mut u64, $o1);
+        *d1.add(8) = b' ';
+        let p0 = d0.add(9);
+        let plo0 = _mm256_castsi256_si128(plo);
+        let phi0 = _mm256_castsi256_si128(phi);
+        let h0 = _mm256_inserti128_si256(_mm256_castsi128_si256(plo0), phi0, 1);
+        _mm256_storeu_si256(p0 as *mut __m256i, h0);
+        if $has_ascii {
+            let asc0 = _mm256_castsi256_si128(asc);
+            *p0.add(32) = b' ';
+            _mm_storeu_si128(p0.add(33) as *mut __m128i, asc0);
+            *p0.add(49) = b'\n';
+        } else {
+            *p0.add(32) = b'\n';
+        }
+        let p1 = d1.add(9);
+        let plo1 = _mm256_extracti128_si256(plo, 1);
+        let phi1 = _mm256_extracti128_si256(phi, 1);
+        let h1 = _mm256_inserti128_si256(_mm256_castsi128_si256(plo1), phi1, 1);
+        _mm256_storeu_si256(p1 as *mut __m256i, h1);
+        if $has_ascii {
+            let asc1 = _mm256_extracti128_si256(asc, 1);
+            *p1.add(32) = b' ';
+            _mm_storeu_si128(p1.add(33) as *mut __m128i, asc1);
+            *p1.add(49) = b'\n';
+        } else {
+            *p1.add(32) = b'\n';
+        }
+    }};
+}
+
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn format_pairs_min_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                               lut: &[u8; 16], has_ascii: bool, row_len: usize) {
+    let lutp = lut.as_ptr();
+    let mut i = 0;
+    while i + 1 < pairs {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+        fast_pair_min_body!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, has_ascii, row_len);
+        fast_pair_min_body!(dst.add((i + 1) * row_len * 2), src.add((i + 1) * 32), o8[2], o8[3], lutp, has_ascii, row_len);
+        i += 2;
+    }
+    if i < pairs {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+        fast_pair_min_body!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, has_ascii, row_len);
+    }
+}
+
+macro_rules! fast_pair_head {
+    ($src:expr, $lutp:expr) => {{
+        let raw = _mm256_loadu_si256($src as *const __m256i);
+        let m0f = _mm256_set1_epi8(0x0f);
+        let lo  = _mm256_and_si256(raw, m0f);
+        let hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), m0f);
+        let lutv = _mm256_broadcastsi128_si256(_mm_loadu_si128($lutp as *const __m128i));
+        let hlo = _mm256_shuffle_epi8(lutv, lo);
+        let hhi = _mm256_shuffle_epi8(lutv, hi);
+        let plo = _mm256_unpacklo_epi8(hhi, hlo);
+        let phi = _mm256_unpackhi_epi8(hhi, hlo);
+        (raw, plo, phi)
+    }};
+}
+
+macro_rules! fast_pair_ascii {
+    ($dst:expr, $src:expr, $o0:expr, $o1:expr, $lutp:expr, $k:expr, $row_len:expr) => {{
+        let (raw, plo, phi) = fast_pair_head!($src, $lutp);
+        let pr = _mm256_and_si256(
+            _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
+            _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
+        let asc = _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr);
+        let d0 = $dst;
+        std::ptr::write_unaligned(d0 as *mut u64, $o0);
+        *(d0.add(8) as *mut u16) = 0x203a;
+        let d1 = d0.add($row_len);
+        std::ptr::write_unaligned(d1 as *mut u64, $o1);
+        *(d1.add(8) as *mut u16) = 0x203a;
+        let p0 = d0.add(10);
+        let plo0 = _mm256_castsi256_si128(plo);
+        let phi0 = _mm256_castsi256_si128(phi);
+        let asc0 = _mm256_castsi256_si128(asc);
+        let e0 = _mm_or_si128(
+            _mm_shuffle_epi8(plo0, _mm_loadu_si128($k.idx_a[0].as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.sp[0].as_ptr() as *const __m128i));
+        let e1 = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo0, _mm_loadu_si128($k.idx_a[1].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi0, _mm_loadu_si128($k.idx_b[1].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[1].as_ptr() as *const __m128i));
+        let fh = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo0, _mm_loadu_si128($k.idx_a[2].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi0, _mm_loadu_si128($k.idx_b[2].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[2].as_ptr() as *const __m128i));
+        let ft = _mm_or_si128(
+            _mm_shuffle_epi8(asc0, _mm_loadu_si128($k.w3_idx.as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.w3_sp.as_ptr() as *const __m128i));
+        let w0 = _mm256_inserti128_si256(_mm256_castsi128_si256(e0), e1, 1);
+        let w1 = _mm256_inserti128_si256(_mm256_castsi128_si256(fh), ft, 1);
+        _mm256_storeu_si256(p0 as *mut __m256i, w0);
+        _mm256_storeu_si256(p0.add(32) as *mut __m256i, w1);
+        let tu = _mm_or_si128(
+            _mm_shuffle_epi8(asc0, _mm_loadu_si128($k.tu_idx.as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.tu_sp.as_ptr() as *const __m128i));
+        *(p0.add(64) as *mut u32) = _mm_cvtsi128_si64(tu) as u32;
+        *p0.add(68) = $k.nl;
+        let p1 = d1.add(10);
+        let plo1 = _mm256_extracti128_si256(plo, 1);
+        let phi1 = _mm256_extracti128_si256(phi, 1);
+        let asc1 = _mm256_extracti128_si256(asc, 1);
+        let g0 = _mm_or_si128(
+            _mm_shuffle_epi8(plo1, _mm_loadu_si128($k.idx_a[0].as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.sp[0].as_ptr() as *const __m128i));
+        let g1 = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo1, _mm_loadu_si128($k.idx_a[1].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi1, _mm_loadu_si128($k.idx_b[1].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[1].as_ptr() as *const __m128i));
+        let gh = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo1, _mm_loadu_si128($k.idx_a[2].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi1, _mm_loadu_si128($k.idx_b[2].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[2].as_ptr() as *const __m128i));
+        let gt = _mm_or_si128(
+            _mm_shuffle_epi8(asc1, _mm_loadu_si128($k.w3_idx.as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.w3_sp.as_ptr() as *const __m128i));
+        let w2 = _mm256_inserti128_si256(_mm256_castsi128_si256(g0), g1, 1);
+        let w3 = _mm256_inserti128_si256(_mm256_castsi128_si256(gh), gt, 1);
+        _mm256_storeu_si256(p1 as *mut __m256i, w2);
+        _mm256_storeu_si256(p1.add(32) as *mut __m256i, w3);
+        let gu = _mm_or_si128(
+            _mm_shuffle_epi8(asc1, _mm_loadu_si128($k.tu_idx.as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.tu_sp.as_ptr() as *const __m128i));
+        *(p1.add(64) as *mut u32) = _mm_cvtsi128_si64(gu) as u32;
+        *p1.add(68) = $k.nl;
+    }};
+}
+
+macro_rules! fast_pair_na {
+    ($dst:expr, $src:expr, $o0:expr, $o1:expr, $lutp:expr, $k:expr, $row_len:expr) => {{
+        let (_raw, plo, phi) = fast_pair_head!($src, $lutp);
+        let d0 = $dst;
+        std::ptr::write_unaligned(d0 as *mut u64, $o0);
+        *(d0.add(8) as *mut u16) = 0x203a;
+        let d1 = d0.add($row_len);
+        std::ptr::write_unaligned(d1 as *mut u64, $o1);
+        *(d1.add(8) as *mut u16) = 0x203a;
+        let p0 = d0.add(10);
+        let plo0 = _mm256_castsi256_si128(plo);
+        let phi0 = _mm256_castsi256_si128(phi);
+        let e0 = _mm_or_si128(
+            _mm_shuffle_epi8(plo0, _mm_loadu_si128($k.idx_a[0].as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.sp[0].as_ptr() as *const __m128i));
+        let e1 = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo0, _mm_loadu_si128($k.idx_a[1].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi0, _mm_loadu_si128($k.idx_b[1].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[1].as_ptr() as *const __m128i));
+        let fh = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo0, _mm_loadu_si128($k.idx_a[2].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi0, _mm_loadu_si128($k.idx_b[2].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[2].as_ptr() as *const __m128i));
+        let ft = _mm_loadu_si128($k.w3_sp.as_ptr() as *const __m128i);
+        let w0 = _mm256_inserti128_si256(_mm256_castsi128_si256(e0), e1, 1);
+        _mm256_storeu_si256(p0 as *mut __m256i, w0);
+        _mm_storeu_si128(p0.add(32) as *mut __m128i, fh);
+        *p0.add(48) = _mm_cvtsi128_si64(ft) as u8;
+        let p1 = d1.add(10);
+        let plo1 = _mm256_extracti128_si256(plo, 1);
+        let phi1 = _mm256_extracti128_si256(phi, 1);
+        let g0 = _mm_or_si128(
+            _mm_shuffle_epi8(plo1, _mm_loadu_si128($k.idx_a[0].as_ptr() as *const __m128i)),
+            _mm_loadu_si128($k.sp[0].as_ptr() as *const __m128i));
+        let g1 = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo1, _mm_loadu_si128($k.idx_a[1].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi1, _mm_loadu_si128($k.idx_b[1].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[1].as_ptr() as *const __m128i));
+        let gh = _mm_or_si128(_mm_or_si128(
+            _mm_shuffle_epi8(plo1, _mm_loadu_si128($k.idx_a[2].as_ptr() as *const __m128i)),
+            _mm_shuffle_epi8(phi1, _mm_loadu_si128($k.idx_b[2].as_ptr() as *const __m128i))),
+            _mm_loadu_si128($k.sp[2].as_ptr() as *const __m128i));
+        let gt = _mm_loadu_si128($k.w3_sp.as_ptr() as *const __m128i);
+        let w2 = _mm256_inserti128_si256(_mm256_castsi128_si256(g0), g1, 1);
+        _mm256_storeu_si256(p1 as *mut __m256i, w2);
+        _mm_storeu_si128(p1.add(32) as *mut __m128i, gh);
+        *p1.add(48) = _mm_cvtsi128_si64(gt) as u8;
+    }};
+}
+
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
-                           k: &CanonKernel, lut: &[u8; 16], row_len: usize) -> usize {
-    let raw = _mm256_loadu_si256(src as *const __m256i);
-    let m0f = _mm256_set1_epi8(0x0f);
-    let lo  = _mm256_and_si256(raw, m0f);
-    let hi  = _mm256_and_si256(_mm256_srli_epi16(raw, 4), m0f);
-    let lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(lut.as_ptr() as *const __m128i));
-    let hlo = _mm256_shuffle_epi8(lut, lo);
-    let hhi = _mm256_shuffle_epi8(lut, hi);
-    let plo = _mm256_unpacklo_epi8(hhi, hlo);
-    let phi = _mm256_unpackhi_epi8(hhi, hlo);
-    let pr = _mm256_and_si256(
-        _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
-        _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
-    let asc = _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr);
-    for r in 0..2 {
-        let d = dst.add(r * row_len);
-        std::ptr::write_unaligned(d as *mut u64, o8[r]);
-        *d.add(8) = b':';
-        *d.add(9) = b' ';
-        let p = d.add(10);
-        let plo_r = if r == 0 { _mm256_castsi256_si128(plo) } else { _mm256_extracti128_si256(plo, 1) };
-        let phi_r = if r == 0 { _mm256_castsi256_si128(phi) } else { _mm256_extracti128_si256(phi, 1) };
-        let v0 = _mm_or_si128(
-            _mm_shuffle_epi8(plo_r, _mm_loadu_si128(k.idx_a[0].as_ptr() as *const __m128i)),
-            _mm_loadu_si128(k.sp[0].as_ptr() as *const __m128i));
-        let v1 = _mm_or_si128(_mm_or_si128(
-            _mm_shuffle_epi8(plo_r, _mm_loadu_si128(k.idx_a[1].as_ptr() as *const __m128i)),
-            _mm_shuffle_epi8(phi_r, _mm_loadu_si128(k.idx_b[1].as_ptr() as *const __m128i))),
-            _mm_loadu_si128(k.sp[1].as_ptr() as *const __m128i));
-        let v2 = _mm_or_si128(_mm_or_si128(
-            _mm_shuffle_epi8(plo_r, _mm_loadu_si128(k.idx_a[2].as_ptr() as *const __m128i)),
-            _mm_shuffle_epi8(phi_r, _mm_loadu_si128(k.idx_b[2].as_ptr() as *const __m128i))),
-            _mm_loadu_si128(k.sp[2].as_ptr() as *const __m128i));
-        let t0 = _mm_or_si128(
-            _mm_shuffle_epi8(asc_extract(r, asc), _mm_loadu_si128(k.t0_idx.as_ptr() as *const __m128i)),
-            _mm_loadu_si128(k.t0_sp.as_ptr() as *const __m128i));
-        let t1 = _mm_or_si128(
-            _mm_shuffle_epi8(asc_extract(r, asc), _mm_loadu_si128(k.t1_idx.as_ptr() as *const __m128i)),
-            _mm_loadu_si128(k.t1_sp.as_ptr() as *const __m128i));
-        _mm_storeu_si128(p as *mut __m128i, v0);
-        _mm_storeu_si128(p.add(16) as *mut __m128i, v1);
-        _mm_storeu_si128(p.add(32) as *mut __m128i, v2);
-        _mm_storeu_si128(p.add(48) as *mut __m128i, t0);
-        *(p.add(64) as *mut u32) = _mm_cvtsi128_si64(t1) as u32;
-        *(p.add(k.tail.0) as *mut u16) = k.tail.1;
+                           k: CanonKernel, lut: &[u8; 16], row_len: usize) -> usize {
+    let lutp = lut.as_ptr();
+    if k.has_ascii {
+        fast_pair_ascii!(dst, src, o8[0], o8[1], lutp, &k, row_len);
+    } else {
+        fast_pair_na!(dst, src, o8[0], o8[1], lutp, &k, row_len);
     }
     row_len * 2
 }
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
-unsafe fn asc_extract(r: usize, asc: __m256i) -> __m128i {
-    if r == 0 { _mm256_castsi256_si128(asc) } else { _mm256_extracti128_si256(asc, 1) }
-}
-
-#[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
-                                lut: &[u8; 16], k: &CanonKernel, row_len: usize) {
-    for i in 0..pairs {
-        let o8 = hex_offsets_4(off.wrapping_add((i * 32) as u64), lut);
-        format_pair_fast(dst.add(i * row_len * 2), src.add(i * 32), [o8[0], o8[1]], k, lut, row_len);
+                                lut: &[u8; 16], k: CanonKernel, row_len: usize) {
+    let lutp = lut.as_ptr();
+    let mut i = 0;
+    if k.has_ascii {
+        while i + 1 < pairs {
+            let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+            fast_pair_ascii!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
+            fast_pair_ascii!(dst.add((i + 1) * row_len * 2), src.add((i + 1) * 32), o8[2], o8[3], lutp, &k, row_len);
+            i += 2;
+        }
+        if i < pairs {
+            let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+            fast_pair_ascii!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
+        }
+    } else {
+        while i + 1 < pairs {
+            let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+            fast_pair_na!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
+            fast_pair_na!(dst.add((i + 1) * row_len * 2), src.add((i + 1) * 32), o8[2], o8[3], lutp, &k, row_len);
+            i += 2;
+        }
+        if i < pairs {
+            let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+            fast_pair_na!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
+        }
     }
 }
 
@@ -1750,6 +2205,7 @@ fn hex_width(opts: &Options) -> usize {
     let group = opts.group;
     match opts.mode {
         DisplayMode::Canonical => {
+            if opts.minimal { return bpr * 2; }
             let mut w = 0;
             for i in 0..bpr {
                 if i > 0 {
@@ -1796,6 +2252,29 @@ fn format_row_generic(
     let width  = opts.width;
     let group  = opts.group;
     let n      = src.len();
+
+    if opts.minimal && opts.mode == DisplayMode::Canonical {
+        if !opts.no_position {
+            let mut tmp = [0u8; 20];
+            let olen = write_offset(&mut tmp, display_off, opts.offset_dec, opts.uppercase);
+            dst.extend_from_slice(&tmp[..olen]);
+            dst.push(b' ');
+        }
+        for i in 0..n {
+            let b = src[i];
+            dst.push(hex[(b >> 4) as usize]);
+            dst.push(hex[(b & 0xf) as usize]);
+        }
+        if !opts.no_ascii {
+            dst.push(b' ');
+            for i in 0..n {
+                let b = src[i];
+                dst.push(if b >= 0x20 && b <= 0x7e { b } else { b'.' });
+            }
+        }
+        dst.push(b'\n');
+        return;
+    }
 
     let left_bar  = match opts.border { BorderStyle::None=>"", BorderStyle::Ascii=>"|", BorderStyle::Unicode=>"│" };
     let mid_bar   = left_bar;
@@ -2005,6 +2484,86 @@ fn read_le_u64(src: &[u8], len: usize, endian: Endian) -> u64 {
     v
 }
 
+#[target_feature(enable = "avx2,ssse3,sse4.1")]
+unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool) {
+    let lut = if upper {
+        _mm_loadu_si128(HEX_UPPER.as_ptr() as *const __m128i)
+    } else {
+        _mm_loadu_si128(HEX_LOWER.as_ptr() as *const __m128i)
+    };
+    let m0f = _mm_set1_epi8(0x0f);
+    for i in 0..blocks {
+        let raw = _mm_loadu_si128(src.add(i * 16) as *const __m128i);
+        let lo = _mm_and_si128(raw, m0f);
+        let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m0f);
+        let hlo = _mm_shuffle_epi8(lut, lo);
+        let hhi = _mm_shuffle_epi8(lut, hi);
+        let plo = _mm_unpacklo_epi8(hhi, hlo);
+        let phi = _mm_unpackhi_epi8(hhi, hlo);
+        _mm_storeu_si128(dst.add(i * 32) as *mut __m128i, plo);
+        _mm_storeu_si128(dst.add(i * 32 + 16) as *mut __m128i, phi);
+    }
+}
+
+fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
+    let blocks = data.len() / 16;
+    let tail_len = data.len() % 16;
+    let chunk_blocks = ((16 * 1024 * 1024) / 32).max(1);
+    let buf_cap = chunk_blocks * 32 + 16;
+
+    let (send_data, recv_data) = sync_channel::<Vec<u8>>(5);
+    let (send_free, recv_free) = channel::<Vec<u8>>();
+    for _ in 0..6 {
+        let buf = vec![0u8; buf_cap];
+        send_free.send(buf).unwrap();
+    }
+    let writer = thread::spawn(move || -> io::Result<()> {
+        let mut zc = ZeroCopyWriter::new()?;
+        let mut prev: Option<Vec<u8>> = None;
+        while let Ok(chunk) = recv_data.recv() {
+            zc.write_chunk(&chunk)?;
+            if let Some(p) = prev.take() {
+                let _ = send_free.send(p);
+            }
+            prev = Some(chunk);
+        }
+        Ok(())
+    });
+
+    let upper = opts.uppercase;
+    let mut cursor = 0usize;
+    while cursor < blocks {
+        let n = (blocks - cursor).min(chunk_blocks);
+        let mut chunk_out = recv_free.recv().unwrap();
+        chunk_out.resize(n * 32 + 16, 0);
+        {
+            chunk_out[..n * 32]
+                .par_chunks_mut(32)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    unsafe {
+                        plain_blocks(row.as_mut_ptr(), data.as_ptr().add((cursor + i) * 16), 1, upper);
+                    }
+                });
+        }
+        chunk_out.truncate(n * 32);
+        send_data.send(chunk_out).unwrap();
+        cursor += n;
+    }
+    drop(send_data);
+    writer.join().unwrap()?;
+
+    let mut so = io::stdout().lock();
+    if tail_len > 0 {
+        let hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+        for &b in &data[blocks * 16..] {
+            so.write_all(&[hex[(b >> 4) as usize], hex[(b & 0xf) as usize]])?;
+        }
+    }
+    so.write_all(b"\n")?;
+    so.flush()
+}
+
 fn run_plain(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
     let _hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
     let stdout = io::stdout();
@@ -2024,6 +2583,95 @@ fn run_plain(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
     }
     out.write_all(b"\n")?;
     out.flush()
+}
+
+fn include_line(dst: *mut u8, src: &[u8], upper: bool) {
+    let hex = if upper { HEX_UPPER } else { HEX_LOWER };
+    let mut p = dst;
+    unsafe {
+        *p = b' ';
+        *p.add(1) = b' ';
+        p = p.add(2);
+        for &b in src {
+            *p = b'0';
+            *p.add(1) = b'x';
+            *p.add(2) = hex[(b >> 4) as usize];
+            *p.add(3) = hex[(b & 0xf) as usize];
+            *p.add(4) = b',';
+            *p.add(5) = b' ';
+            p = p.add(6);
+        }
+    }
+}
+
+fn run_c_include_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
+    let name = opts.include_name.as_deref().unwrap_or("data");
+    let lines = data.len() / 12;
+    let tail_len = data.len() % 12;
+    let line_len = 75usize;
+    let chunk_lines = ((16 * 1024 * 1024) / line_len).max(1);
+    let buf_cap = chunk_lines * line_len + 16;
+
+    {
+        let mut so = io::stdout().lock();
+        writeln!(so, "unsigned char {}[] = {{", name)?;
+        so.flush()?;
+    }
+
+    let (send_data, recv_data) = sync_channel::<Vec<u8>>(5);
+    let (send_free, recv_free) = channel::<Vec<u8>>();
+    for _ in 0..6 {
+        let buf = vec![0u8; buf_cap];
+        send_free.send(buf).unwrap();
+    }
+    let writer = thread::spawn(move || -> io::Result<()> {
+        let mut zc = ZeroCopyWriter::new()?;
+        let mut prev: Option<Vec<u8>> = None;
+        while let Ok(chunk) = recv_data.recv() {
+            zc.write_chunk(&chunk)?;
+            if let Some(p) = prev.take() {
+                let _ = send_free.send(p);
+            }
+            prev = Some(chunk);
+        }
+        Ok(())
+    });
+
+    let upper = opts.uppercase;
+    let mut cursor = 0usize;
+    while cursor < lines {
+        let n = (lines - cursor).min(chunk_lines);
+        let mut chunk_out = recv_free.recv().unwrap();
+        chunk_out.resize(n * line_len + 16, 0);
+        {
+            chunk_out[..n * line_len]
+                .par_chunks_mut(line_len)
+                .enumerate()
+                .for_each(|(i, row)| {
+                    let src = &data[(cursor + i) * 12..(cursor + i) * 12 + 12];
+                    include_line(row.as_mut_ptr(), src, upper);
+                    unsafe { *row.as_mut_ptr().add(74) = b'\n'; }
+                });
+        }
+        chunk_out.truncate(n * line_len);
+        send_data.send(chunk_out).unwrap();
+        cursor += n;
+    }
+    drop(send_data);
+    writer.join().unwrap()?;
+
+    {
+        let mut so = io::stdout().lock();
+        if tail_len > 0 {
+            let mut tmp = [0u8; 75];
+            include_line(tmp.as_mut_ptr(), &data[lines * 12..], opts.uppercase);
+            let tlen = tail_len * 6;
+            so.write_all(&tmp[..tlen])?;
+        }
+        writeln!(so, "\n}};")?;
+        writeln!(so, "unsigned int {}_len = {};", name, data.len())?;
+        so.flush()
+    }
 }
 
 fn run_c_include(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
@@ -2532,10 +3180,16 @@ fn use_color(opts: &Options) -> bool {
 
 /// True iff we can use the SIMD canonical fast path (no generic overhead).
 fn is_simd_eligible(opts: &Options, do_color: bool) -> bool {
-    opts.mode == DisplayMode::Canonical
-        && !do_color
+    matches!(opts.mode, DisplayMode::Canonical
+        | DisplayMode::OneByteHex
+        | DisplayMode::TwoByteHex)
         && matches!(opts.table, CharTable::Ascii | CharTable::Braille)
         && opts.formats.is_empty()
+        && (!do_color
+            || (opts.scheme == ColorScheme::Default
+                && opts.table == CharTable::Ascii
+                && opts.border == BorderStyle::None
+                && !opts.no_ascii))
 }
 
 fn old_simd_eligible(opts: &Options) -> bool {
@@ -2661,12 +3315,10 @@ fn main() -> io::Result<()> {
             // Plain / CInclude / custom format
             match opts.mode {
                 DisplayMode::Plain => {
-                    let mut slice: &[u8] = data;
-                    return run_plain(&opts, &mut slice);
+                    return run_plain_mmap(&opts, data);
                 }
                 DisplayMode::CInclude => {
-                    let mut slice: &[u8] = data;
-                    return run_c_include(&opts, &mut slice);
+                    return run_c_include_mmap(&opts, data);
                 }
                 _ => {}
             }
@@ -2675,22 +3327,34 @@ fn main() -> io::Result<()> {
             }
 
             let simd_ok = is_simd_eligible(&opts, do_color);
-            let use_avx2 = simd_ok && is_x86_feature_detected!("avx2");
+            let avx2_hw = is_x86_feature_detected!("avx2");
+            let use_avx2 = simd_ok && avx2_hw;
             let use_simd = simd_ok && (use_avx2 ||
                 (is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")));
             let use_avx512 = use_simd
                 && is_x86_feature_detected!("avx512f")
                 && is_x86_feature_detected!("avx512bw");
 
-            let needs_serial = opts.mode != DisplayMode::Canonical
-                || do_color || opts.squeeze || opts.max_lines.is_some() || !opts.formats.is_empty()
-                || !use_simd;
-
-            if needs_serial {
-                return run_serial_mmap(&opts, data, start_disp, do_color, use_simd);
-            } else {
+            let colored_simd = do_color
+                && opts.scheme == ColorScheme::Default
+                && opts.table == CharTable::Ascii
+                && opts.border == BorderStyle::None
+                && !opts.no_ascii;
+            let serial_only = opts.squeeze || opts.max_lines.is_some();
+            if serial_only {
+                return run_serial_mmap(&opts, data, start_disp, do_color, use_simd, use_avx2);
+            }
+            let octal_fast = opts.mode == DisplayMode::OneByteOctal
+                && opts.width == 16
+                && opts.border == BorderStyle::None
+                && !opts.no_position
+                && !opts.offset_dec
+                && avx2_hw
+                && start_disp.wrapping_add(data.len() as u64) <= 0xFFFF_FFFF;
+            if octal_fast || (use_simd && (!do_color || colored_simd)) {
                 return run_parallel_mmap(&opts, data, start_disp, use_avx2, use_avx512);
             }
+            return run_parallel_scalar(&opts, data, start_disp, do_color);
         }
     }
 
@@ -2731,35 +3395,49 @@ fn main() -> io::Result<()> {
     }
 
     let simd_ok   = is_simd_eligible(&opts, do_color);
-    let use_simd  = simd_ok &&
-        is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1");
+    let use_avx2  = simd_ok && is_x86_feature_detected!("avx2");
+    let use_simd  = simd_ok && (use_avx2 ||
+        (is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")));
 
-    run_streaming(&opts, &mut reader, do_color, use_simd)
+    run_streaming(&opts, &mut reader, do_color, use_simd, use_avx2)
 }
 
-fn run_parallel_mmap(
-    opts:       &Options,
-    data:       &[u8],
-    start_off:  u64,
-    use_avx2:   bool,
-    use_avx512: bool,
+fn row_len_delta(opts: &Options, src: &[u8]) -> i64 {
+    match opts.mode {
+        DisplayMode::OneByteChar => src.iter().map(|&b| match b {
+            0x00 | 0x07..=0x0d => -1i64,
+            _ => 0,
+        }).sum(),
+        _ => match opts.table {
+            CharTable::Cp437 => src.iter().map(|&b| CP437[b as usize].len_utf8() as i64 - 1).sum(),
+            CharTable::Default => src.iter().map(|&b| {
+                if b == 0x00 { 2 } else if b == 0x20 || (0x21..=0x7e).contains(&b) { 0 } else { 2 }
+            }).sum(),
+            _ => 0,
+        },
+    }
+}
+
+fn run_parallel_scalar(
+    opts:      &Options,
+    data:      &[u8],
+    start_off: u64,
+    do_color:  bool,
 ) -> io::Result<()> {
     let width     = opts.width;
     let file_sz   = data.len();
     let full_rows = file_sz / width;
     let tail_len  = file_sz % width;
-    let full_kind = if old_simd_eligible(opts) { LayoutKind::Generic } else { LayoutKind::OutputLine };
-    let tail_kind = if old_simd_eligible(opts) { LayoutKind::Scalar } else { LayoutKind::OutputLine };
-    let cfg       = RowCfg::new(opts, full_kind, tail_kind);
+    let scalar_kind = if opts.minimal { LayoutKind::Generic } else { LayoutKind::OutputLine };
+    let cfg       = RowCfg::new(opts, scalar_kind, scalar_kind);
     let core      = &cfg.core;
-    let blocks    = core.blocks;
 
     let pos_w = if opts.no_position { 0 } else {
         (if opts.offset_dec { 20 } else { offset_len(u64::MAX) }) + 1
     };
     let hex_w   = hex_width(opts);
     let ascii_w = ascii_width(opts);
-    let has_ascii = !opts.no_ascii;
+    let has_ascii = !opts.no_ascii && !matches!(opts.mode, DisplayMode::Binary | DisplayMode::OneByteOctal | DisplayMode::TwoByteOctal | DisplayMode::OneByteDecimal | DisplayMode::TwoByteDecimal | DisplayMode::OneByteChar | DisplayMode::OneByteHex | DisplayMode::TwoByteHex);
     if opts.border != BorderStyle::None {
         let mut so = io::stdout().lock();
         border_top(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
@@ -2823,9 +3501,232 @@ fn run_parallel_mmap(
         Ok(())
     });
 
-    let use_pairs = use_avx2 && width == 16 && opts.table == CharTable::Ascii;
+    let colored_row = !output_line_diverts(opts);
+    let variable = opts.mode == DisplayMode::OneByteChar
+        || ((opts.mode == DisplayMode::Canonical && !opts.no_ascii)
+            && matches!(opts.table, CharTable::Cp437 | CharTable::Default));
+
+    for s in 0..bounds.len() - 1 {
+        let seg_start = bounds[s];
+        let seg_end   = bounds[s + 1];
+        let row_len   = row_len_at(seg_start);
+        let mut row_cursor = seg_start;
+        while row_cursor < seg_end {
+            let rows = (seg_end - row_cursor).min(chunk_rows);
+            let mut chunk_out = recv_free.recv().unwrap();
+            if variable {
+                let deltas: Vec<i64> = (row_cursor..row_cursor + rows)
+                    .into_par_iter()
+                    .map(|r| row_len_delta(opts, &data[r * width..r * width + width]))
+                    .collect();
+                let mut offsets = vec![0i64; rows + 1];
+                for i in 0..rows {
+                    offsets[i + 1] = offsets[i] + row_len as i64 + deltas[i];
+                }
+                let payload = offsets[rows] as usize;
+                chunk_out.resize(payload + 16, 0);
+                {
+                    let out_ptr = chunk_out.as_mut_ptr() as usize;
+                    (0..rows).into_par_iter()
+                        .fold(|| Vec::with_capacity(128), |mut v, i| {
+                            v.clear();
+                            let src_off = (row_cursor + i) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            if colored_row {
+                                output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color, 0, 0).unwrap();
+                            } else {
+                                format_row_generic(&mut v, &data[src_off..src_off + width], off, opts);
+                            }
+                            let o0 = offsets[i] as usize;
+                            unsafe {
+                                std::slice::from_raw_parts_mut((out_ptr + o0) as *mut u8, v.len()).copy_from_slice(&v);
+                            }
+                            v
+                        })
+                        .for_each(|_| {});
+                }
+                chunk_out.truncate(payload);
+            } else {
+                let payload = rows * row_len;
+                chunk_out.resize(payload + 16, 0);
+                {
+                    let out_rows = &mut chunk_out[..payload];
+                    out_rows
+                        .par_chunks_mut(row_len)
+                        .enumerate()
+                        .fold(|| Vec::with_capacity(row_len + 16), |mut v, (i, row)| {
+                            v.clear();
+                            let src_off = (row_cursor + i) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            if colored_row {
+                                output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color, 0, 0).unwrap();
+                            } else {
+                                format_row_generic(&mut v, &data[src_off..src_off + width], off, opts);
+                            }
+                            row[..v.len().min(row_len)].copy_from_slice(&v[..v.len().min(row_len)]);
+                            v
+                        })
+                        .for_each(|_| {});
+                }
+                chunk_out.truncate(payload);
+            }
+            send_data.send(chunk_out).unwrap();
+            row_cursor += rows;
+        }
+    }
+
+    drop(send_data);
+    writer.join().unwrap()?;
+
+    let mut so = io::stdout().lock();
+    if tail_len > 0 {
+        let src_off = full_rows * width;
+        let off     = start_off.wrapping_add(src_off as u64);
+        let mut v = Vec::with_capacity(256);
+        if colored_row {
+            output_line(&mut v, &data[src_off..], off, opts, do_color, 0, 0)?;
+        } else {
+            format_row_generic(&mut v, &data[src_off..], off, opts);
+        }
+        so.write_all(&v)?;
+    }
+
+    if opts.border != BorderStyle::None {
+        border_bottom(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+    } else if !opts.no_position {
+        let final_off = start_off.wrapping_add(file_sz as u64);
+        let mut tmp = [0u8; 20];
+        let olen = write_offset(&mut tmp, final_off, opts.offset_dec, opts.uppercase);
+        if do_color { so.write_all(ANSI_CYAN.as_bytes())?; }
+        so.write_all(&tmp[..olen])?;
+        if do_color { so.write_all(ANSI_RESET.as_bytes())?; }
+        so.write_all(b"\n")?;
+    }
+
+    so.flush()
+}
+
+fn run_parallel_mmap(
+    opts:       &Options,
+    data:       &[u8],
+    start_off:  u64,
+    use_avx2:   bool,
+    use_avx512: bool,
+) -> io::Result<()> {
+    let width     = opts.width;
+    let file_sz   = data.len();
+    let full_rows = file_sz / width;
+    let tail_len  = file_sz % width;
+    let full_kind = if opts.minimal {
+        LayoutKind::Generic
+    } else if use_color(opts) || !old_simd_eligible(opts) {
+        LayoutKind::OutputLine
+    } else {
+        LayoutKind::Generic
+    };
+    let tail_kind = if opts.minimal {
+        LayoutKind::Generic
+    } else if use_color(opts) || !old_simd_eligible(opts) {
+        LayoutKind::OutputLine
+    } else {
+        LayoutKind::Scalar
+    };
+    let cfg       = RowCfg::new(opts, full_kind, tail_kind);
+    let core      = &cfg.core;
+    let blocks    = core.blocks;
+
+    let pos_w = if opts.no_position { 0 } else {
+        (if opts.offset_dec { 20 } else { offset_len(u64::MAX) }) + 1
+    };
+    let hex_w   = hex_width(opts);
+    let ascii_w = ascii_width(opts);
+    let has_ascii = !opts.no_ascii && !matches!(opts.mode, DisplayMode::Binary | DisplayMode::OneByteOctal | DisplayMode::TwoByteOctal | DisplayMode::OneByteDecimal | DisplayMode::TwoByteDecimal | DisplayMode::OneByteChar | DisplayMode::OneByteHex | DisplayMode::TwoByteHex);
+    if opts.border != BorderStyle::None {
+        let mut so = io::stdout().lock();
+        border_top(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+        border_header(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+        border_sep(&mut so, pos_w, hex_w, ascii_w, !opts.no_position, has_ascii, opts.border)?;
+        so.flush()?;
+    }
+
+    let field_len_at = |row: usize| field_len_for(opts, start_off.wrapping_add((row * width) as u64));
+    let row_len_at   = |row: usize| core.prefix_len(field_len_at(row)) + core.full.emitted;
+
+    let mut bounds = vec![0usize, full_rows];
+    {
+        let mut push = |v: u64| {
+            if v > start_off {
+                let r = ((v - start_off) as usize).div_ceil(width);
+                if r > 0 && r < full_rows { bounds.push(r); }
+            }
+        };
+        if opts.offset_dec {
+            for k in 8..=19u32 { push(10u64.pow(k)); }
+        } else {
+            for k in 8..=15u32 { push(1u64 << (4 * k)); }
+        }
+    }
+    bounds.sort_unstable();
+    bounds.dedup();
+
+    let first = row_len_at(0);
+    let last  = if full_rows > 0 { row_len_at(full_rows - 1) } else { first };
+    let nbuf = 6usize;
+    let chunk_rows = ((16 * 1024 * 1024) / first.min(last)).max(1);
+    let buf_cap    = chunk_rows * first.max(last) + 16;
+
+    #[cfg(unix)]
+    unsafe {
+        libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_WILLNEED);
+    }
+
+    let (send_data, recv_data) = sync_channel::<Vec<u8>>(nbuf - 1);
+    let (send_free, recv_free) = channel::<Vec<u8>>();
+    for _ in 0..nbuf {
+        let buf = vec![0u8; buf_cap];
+        #[cfg(unix)]
+        unsafe {
+            libc::madvise(buf.as_ptr() as *mut libc::c_void, buf.len(), libc::MADV_HUGEPAGE);
+        }
+        send_free.send(buf).unwrap();
+    }
+
+    let writer = thread::spawn(move || -> io::Result<()> {
+        let mut zc = ZeroCopyWriter::new()?;
+        let mut prev: Option<Vec<u8>> = None;
+        while let Ok(chunk) = recv_data.recv() {
+            zc.write_chunk(&chunk)?;
+            if let Some(p) = prev.take() {
+                let _ = send_free.send(p);
+            }
+            prev = Some(chunk);
+        }
+        Ok(())
+    });
+
+    let use_pairs = use_avx2 && width == 16 && opts.table == CharTable::Ascii
+        && core.full.colored.is_none()
+        && (core.full.fast.is_some()
+            || (core.full.windows.len() == 4 && core.full.ascii_run >= 16));
+    let octal_all = opts.mode == DisplayMode::OneByteOctal
+        && opts.width == 16
+        && opts.border == BorderStyle::None
+        && !opts.no_position
+        && !opts.offset_dec
+        && start_off.wrapping_add(file_sz as u64) <= 0xFFFF_FFFF;
+    let use_octal = octal_all && is_x86_feature_detected!("avx2");
+    let min_all = opts.minimal
+        && width == 16
+        && opts.table == CharTable::Ascii
+        && !opts.no_position
+        && !opts.offset_dec
+        && !use_color(opts)
+        && start_off.wrapping_add(file_sz as u64) <= 0xFFFF_FFFF;
+    let use_min = min_all && use_avx2;
     let use_fours = use_avx512 && width == 16 && opts.table == CharTable::Ascii
-        && core.full.fast.is_none();
+        && core.full.fast.is_none() && core.full.colored.is_none()
+        && core.full.windows.len() == 4 && core.full.ascii_run >= 16;
+    let do_color = use_color(opts);
 
     for s in 0..bounds.len() - 1 {
         let seg_start = bounds[s];
@@ -2840,7 +3741,65 @@ fn run_parallel_mmap(
             chunk_out.resize(payload + 16, 0);
             {
                 let out_rows = &mut chunk_out[..payload];
-                if use_fours {
+                if use_min {
+                    let row_len_m = if opts.no_ascii { 42usize } else { 59usize };
+                    let lut = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+                    let even = rows & !1;
+                    let run_pairs = even / 256;
+                    let run_end = run_pairs * 256;
+                    out_rows[..run_end * row_len_m]
+                        .par_chunks_mut(row_len_m * 256)
+                        .enumerate()
+                        .for_each(|(i, block)| {
+                            let src_off = (row_cursor + i * 256) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_pairs_min_run(block.as_mut_ptr(), data.as_ptr().add(src_off),
+                                                     off, 128, lut, !opts.no_ascii, row_len_m);
+                            }
+                        });
+                    if even > run_end {
+                        let src_off = (row_cursor + run_end) * width;
+                        let off = start_off.wrapping_add(src_off as u64);
+                        unsafe {
+                            format_pairs_min_run(out_rows[run_end * row_len_m..].as_mut_ptr(), data.as_ptr().add(src_off),
+                                                 off, (even - run_end) / 2, lut, !opts.no_ascii, row_len_m);
+                        }
+                    }
+                    if rows & 1 != 0 {
+                        let i = rows - 1;
+                        let src_off = (row_cursor + i) * width;
+                        let off = start_off.wrapping_add(src_off as u64);
+                        unsafe {
+                            format_row(out_rows[i * row_len_m..].as_mut_ptr(),
+                                       data.as_ptr().add(src_off), off, width, core, &core.full);
+                        }
+                    }
+                } else if use_octal {
+                    let row_len_o = 75usize;
+                    let even = rows;
+                    let run_rows = even / 256;
+                    let run_end = run_rows * 256;
+                    out_rows[..run_end * row_len_o]
+                        .par_chunks_mut(row_len_o * 256)
+                        .enumerate()
+                        .for_each(|(i, block)| {
+                            let src_off = (row_cursor + i * 256) * width;
+                            let off = start_off.wrapping_add(src_off as u64);
+                            unsafe {
+                                format_octal_run(block.as_mut_ptr(), data.as_ptr().add(src_off),
+                                                 off, 256, opts.uppercase, row_len_o);
+                            }
+                        });
+                    if even > run_end {
+                        let src_off = (row_cursor + run_end) * width;
+                        let off = start_off.wrapping_add(src_off as u64);
+                        unsafe {
+                            format_octal_run(out_rows[run_end * row_len_o..].as_mut_ptr(), data.as_ptr().add(src_off),
+                                             off, even - run_end, opts.uppercase, row_len_o);
+                        }
+                    }
+                } else if use_fours {
                     let (idx, sp) = pair_masks(&core.full);
                     let last_off = start_off.wrapping_add(((row_cursor + rows - 1) * width) as u64);
                     let fast_all = core.opts.border == BorderStyle::None
@@ -2909,19 +3868,19 @@ fn run_parallel_mmap(
                         && last_off.wrapping_add(48) <= 0xFFFF_FFFF;
                     let lut = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
                     let even = rows & !1;
-                    let run_pairs = even / 8;
-                    let run_end = run_pairs * 8;
+                    let run_pairs = even / 256;
+                    let run_end = run_pairs * 256;
                     if fast_all && core.full.fast.is_some() {
                         let k = core.full.fast.as_ref().unwrap();
                         out_rows[..run_end * row_len]
-                            .par_chunks_mut(row_len * 8)
+                            .par_chunks_mut(row_len * 256)
                             .enumerate()
                             .for_each(|(i, block)| {
-                                let src_off = (row_cursor + i * 8) * width;
+                                let src_off = (row_cursor + i * 256) * width;
                                 let off = start_off.wrapping_add(src_off as u64);
                                 unsafe {
                                     format_pairs_fast_run(block.as_mut_ptr(), data.as_ptr().add(src_off),
-                                                          off, 4, lut, k, row_len);
+                                                          off, 128, lut, *k, row_len);
                                 }
                             });
                         if even > run_end {
@@ -2929,7 +3888,7 @@ fn run_parallel_mmap(
                             let off = start_off.wrapping_add(src_off as u64);
                             unsafe {
                                 format_pairs_fast_run(out_rows[run_end * row_len..].as_mut_ptr(), data.as_ptr().add(src_off),
-                                                      off, (even - run_end) / 2, lut, k, row_len);
+                                                      off, (even - run_end) / 2, lut, *k, row_len);
                             }
                         }
                         if rows & 1 != 0 {
@@ -3007,13 +3966,19 @@ fn run_parallel_mmap(
     if tail_len > 0 {
         let src_off = full_rows * width;
         let off     = start_off.wrapping_add(src_off as u64);
-        let mut tmp = vec![0u8; blocks * 16];
-        tmp[..tail_len].copy_from_slice(&data[src_off..]);
-        let layout = cfg.layout(tail_len);
-        let cap = core.prefix_len(field_len_at(full_rows)) + layout.emitted + 16;
-        let mut v = vec![0u8; cap];
-        let n = unsafe { format_row(v.as_mut_ptr(), tmp.as_ptr(), off, tail_len, core, layout) };
-        so.write_all(&v[..n])?;
+        if use_octal || use_min {
+            let mut v = Vec::with_capacity(128);
+            format_row_generic(&mut v, &data[src_off..], off, opts);
+            so.write_all(&v)?;
+        } else {
+            let mut tmp = vec![0u8; blocks * 16];
+            tmp[..tail_len].copy_from_slice(&data[src_off..]);
+            let layout = cfg.layout(tail_len);
+            let cap = core.prefix_len(field_len_at(full_rows)) + layout.emitted + 16;
+            let mut v = vec![0u8; cap];
+            let n = unsafe { format_row(v.as_mut_ptr(), tmp.as_ptr(), off, tail_len, core, layout) };
+            so.write_all(&v[..n])?;
+        }
     }
 
     if opts.border != BorderStyle::None {
@@ -3022,7 +3987,9 @@ fn run_parallel_mmap(
         let final_off = start_off.wrapping_add(file_sz as u64);
         let mut tmp = [0u8; 20];
         let olen = write_offset(&mut tmp, final_off, opts.offset_dec, opts.uppercase);
+        if do_color { so.write_all(ANSI_CYAN.as_bytes())?; }
         so.write_all(&tmp[..olen])?;
+        if do_color { so.write_all(ANSI_RESET.as_bytes())?; }
         so.write_all(b"\n")?;
     }
 
@@ -3035,6 +4002,7 @@ fn run_serial_mmap(
     start_off: u64,
     do_color:  bool,
     use_simd:  bool,
+    use_avx2:  bool,
 ) -> io::Result<()> {
     let bpr       = opts.width;
     let file_sz   = data.len();
@@ -3064,17 +4032,106 @@ fn run_serial_mmap(
     let mut squeezed            = false;
     let mut lines_written: u64  = 0;
     let simd_ok                 = is_simd_eligible(opts, do_color);
-    let full_kind = if old_simd_eligible(opts) { LayoutKind::Generic } else { LayoutKind::OutputLine };
+    let full_kind = if opts.minimal {
+        LayoutKind::Generic
+    } else if do_color || !old_simd_eligible(opts) {
+        LayoutKind::OutputLine
+    } else {
+        LayoutKind::Generic
+    };
     let cfg                     = if simd_ok && use_simd {
-        Some(RowCfg::new(opts, full_kind, LayoutKind::OutputLine))
+        Some(RowCfg::new(opts, full_kind, if opts.minimal { LayoutKind::Generic } else { LayoutKind::OutputLine }))
     } else { None };
     let core                    = cfg.as_ref().map(|c| &c.core);
     let max_field               = field_len_for(opts, start_off.wrapping_add(file_sz as u64));
-    let row_cap                 = core.map_or(16, |c| (c.prefix_len(max_field) + c.full.emitted) * 2 + 32);
+    let row_cap                 = core.map_or(16, |c| (c.prefix_len(max_field) + c.full.emitted) * 16 + 32);
     let mut row_buf             = vec![0u8; row_cap];
     let mut scratch             = vec![0u8; core.map_or(0, |c| c.blocks * 16).max(32)];
     let pair_ok                 = core.map_or(false, can_pair)
-        && !opts.squeeze && opts.max_lines.is_none();
+        && use_avx2 && !opts.squeeze && opts.max_lines.is_none();
+    let min_ser = use_avx2 && opts.minimal && bpr == 16
+        && !opts.no_position && !opts.offset_dec
+        && start_off.wrapping_add(((full_rows.saturating_sub(1)) * bpr) as u64) <= 0xFFFF_FFFF;
+    let run_ok                  = (pair_ok && core.and_then(|c| c.full.fast.as_ref()).is_some() || min_ser)
+        && !opts.offset_dec
+        && start_off.wrapping_add(((full_rows.saturating_sub(1)) * bpr) as u64) <= 0xFFFF_FFFF;
+
+    if run_ok {
+        let core = core.unwrap();
+        let lut = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+        let row_len = if opts.minimal {
+            if opts.no_ascii { 42 } else { 59 }
+        } else {
+            core.prefix_len(8) + core.full.emitted
+        };
+        let mut r = 0usize;
+        while r + 16 <= full_rows {
+            if opts.minimal {
+                unsafe {
+                    format_pairs_min_run(row_buf.as_mut_ptr(), data.as_ptr().add(r * bpr),
+                                         start_off.wrapping_add((r * bpr) as u64), 8, lut, !opts.no_ascii, row_len);
+                }
+            } else {
+                let k = core.full.fast.as_ref().unwrap();
+                unsafe {
+                    format_pairs_fast_run(row_buf.as_mut_ptr(), data.as_ptr().add(r * bpr),
+                                          start_off.wrapping_add((r * bpr) as u64), 8, lut, *k, row_len);
+                }
+            }
+            out.write_all(&row_buf[..row_len * 16])?;
+            r += 16;
+        }
+        let rem = full_rows - r;
+        if rem >= 2 {
+            let pairs = rem / 2;
+            if opts.minimal {
+                unsafe {
+                    format_pairs_min_run(row_buf.as_mut_ptr(), data.as_ptr().add(r * bpr),
+                                         start_off.wrapping_add((r * bpr) as u64), pairs, lut, !opts.no_ascii, row_len);
+                }
+            } else {
+                let k = core.full.fast.as_ref().unwrap();
+                unsafe {
+                    format_pairs_fast_run(row_buf.as_mut_ptr(), data.as_ptr().add(r * bpr),
+                                          start_off.wrapping_add((r * bpr) as u64), pairs, lut, *k, row_len);
+                }
+            }
+            out.write_all(&row_buf[..row_len * pairs * 2])?;
+            r += pairs * 2;
+        }
+        if r < full_rows {
+            let disp_off = start_off.wrapping_add((r * bpr) as u64);
+            let src_ptr = if r * bpr + core.blocks * 16 <= file_sz {
+                unsafe { data.as_ptr().add(r * bpr) }
+            } else {
+                scratch[..bpr].copy_from_slice(&data[r * bpr..]);
+                scratch.as_ptr()
+            };
+            let n = unsafe { format_row(row_buf.as_mut_ptr(), src_ptr, disp_off, bpr, core, &core.full) };
+            out.write_all(&row_buf[..n])?;
+        }
+        if tail_len > 0 && opts.max_lines.map_or(true, |m| lines_written < m) {
+            let src_off  = full_rows * bpr;
+            let disp_off = start_off.wrapping_add(src_off as u64);
+            scratch[..tail_len].copy_from_slice(&data[src_off..]);
+            let layout = cfg.as_ref().unwrap().layout(tail_len);
+            let n = unsafe { format_row(row_buf.as_mut_ptr(), scratch.as_ptr(), disp_off, tail_len, core, layout) };
+            out.write_all(&row_buf[..n])?;
+        }
+        if opts.border != BorderStyle::None {
+            border_bottom(&mut out, pos_w, hex_w, ascii_w, !opts.no_position,
+                          has_ascii, opts.border)?;
+        } else if !opts.no_position {
+            let final_off = start_off.wrapping_add(file_sz as u64);
+            let mut tmp = [0u8; 20];
+            let olen = write_offset(&mut tmp, final_off, opts.offset_dec, opts.uppercase);
+            if do_color { out.write_all(ANSI_CYAN.as_bytes())?; }
+            out.write_all(&tmp[..olen])?;
+            if do_color { out.write_all(ANSI_RESET.as_bytes())?; }
+            out.write_all(b"\n")?;
+        }
+        return out.flush();
+    }
 
     let mut r = 0usize;
     while r < full_rows {
@@ -3156,6 +4213,7 @@ fn run_streaming(
     reader:    &mut dyn Read,
     do_color:  bool,
     use_simd:  bool,
+    use_avx2:  bool,
 ) -> io::Result<()> {
     let bpr = opts.width;
 
@@ -3186,7 +4244,11 @@ fn run_streaming(
     let simd_eligible = is_simd_eligible(opts, do_color) && use_simd;
     let cfg = if simd_eligible {
         let kind = |tail: bool| {
-            if old_simd_eligible(opts) {
+            if opts.minimal {
+                LayoutKind::Generic
+            } else if do_color {
+                LayoutKind::OutputLine
+            } else if old_simd_eligible(opts) {
                 if tail { LayoutKind::Scalar } else { LayoutKind::Generic }
             } else if opts.border != BorderStyle::None {
                 LayoutKind::OutputLine
@@ -3241,8 +4303,75 @@ fn run_streaming(
             &rbuf[..n]
         };
 
-        let pair_ok = simd_eligible && !opts.squeeze
+        let pair_ok = simd_eligible && use_avx2 && !opts.squeeze
             && opts.max_lines.is_none() && can_pair(core.unwrap());
+        let min_str = use_avx2 && opts.minimal && bpr == 16
+            && !opts.no_position && !opts.offset_dec;
+        let run_ok = (pair_ok && core.and_then(|c| c.full.fast.as_ref()).is_some() || min_str)
+            && !opts.offset_dec
+            && offset.wrapping_add(((full_rows.saturating_sub(1)) * bpr) as u64) <= 0xFFFF_FFFF;
+        if run_ok {
+            let core = core.unwrap();
+            let lut = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+            let row_len = if opts.minimal {
+                if opts.no_ascii { 42 } else { 59 }
+            } else {
+                core.prefix_len(8) + core.full.emitted
+            };
+            let mut r = 0usize;
+            while r + 16 <= full_rows {
+                if wpos + row_len * 16 + 16 > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
+                if opts.minimal {
+                    unsafe {
+                        format_pairs_min_run(wbuf[wpos..].as_mut_ptr(), combined.as_ptr().add(r * bpr),
+                                             offset.wrapping_add((r * bpr) as u64), 8, lut, !opts.no_ascii, row_len);
+                    }
+                } else {
+                    let k = core.full.fast.as_ref().unwrap();
+                    unsafe {
+                        format_pairs_fast_run(wbuf[wpos..].as_mut_ptr(), combined.as_ptr().add(r * bpr),
+                                              offset.wrapping_add((r * bpr) as u64), 8, lut, *k, row_len);
+                    }
+                }
+                wpos += row_len * 16;
+                r += 16;
+            }
+            let rem = full_rows - r;
+            if rem >= 2 {
+                if wpos + row_len * 16 + 16 > wbuf.len() { out.write_all(&wbuf[..wpos])?; wpos = 0; }
+                if opts.minimal {
+                    unsafe {
+                        format_pairs_min_run(wbuf[wpos..].as_mut_ptr(), combined.as_ptr().add(r * bpr),
+                                             offset.wrapping_add((r * bpr) as u64), rem / 2, lut, !opts.no_ascii, row_len);
+                    }
+                } else {
+                    let k = core.full.fast.as_ref().unwrap();
+                    unsafe {
+                        format_pairs_fast_run(wbuf[wpos..].as_mut_ptr(), combined.as_ptr().add(r * bpr),
+                                              offset.wrapping_add((r * bpr) as u64), rem / 2, lut, *k, row_len);
+                    }
+                }
+                wpos += row_len * (rem / 2) * 2;
+                r += (rem / 2) * 2;
+            }
+            if r < full_rows {
+                let src = &combined[r * bpr..(r + 1) * bpr];
+                let src_ptr = if r * bpr + core.blocks * 16 <= combined.len() {
+                    src.as_ptr()
+                } else {
+                    row_tmp[..bpr].copy_from_slice(src);
+                    row_tmp.as_ptr()
+                };
+                let n = unsafe { format_row(wbuf[wpos..].as_mut_ptr(), src_ptr, offset.wrapping_add((r * bpr) as u64), bpr, core, &core.full) };
+                wpos += n;
+            }
+            offset = offset.wrapping_add((full_rows * bpr) as u64);
+            carry_len = new_tail;
+            if new_tail > 0 {
+                carry[..new_tail].copy_from_slice(&combined[full_rows * bpr..]);
+            }
+            continue;
+        }
         let mut r = 0usize;
         while r < full_rows {
             if opts.max_lines.map_or(false, |m| lines_written >= m) { break; }
