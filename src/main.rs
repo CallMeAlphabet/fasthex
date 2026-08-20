@@ -747,7 +747,7 @@ impl ZeroCopyWriter {
         unsafe { self.write_zero_copy(buf) }
     }
 
-    unsafe fn write_zero_copy(&mut self, buf: &[u8]) -> io::Result<()> {
+    unsafe fn write_zero_copy(&mut self, buf: &[u8]) -> io::Result<()> { unsafe {
         let mut pos = 0usize;
         while pos < buf.len() {
             let iov = libc::iovec {
@@ -775,9 +775,9 @@ impl ZeroCopyWriter {
             }
         }
         Ok(())
-    }
+    }}
 
-    unsafe fn splice_out(&mut self, len: usize) -> io::Result<()> {
+    unsafe fn splice_out(&mut self, len: usize) -> io::Result<()> { unsafe {
         let mut remain = len;
         while remain > 0 {
             let n = libc::splice(self.pipe_r, std::ptr::null_mut(),
@@ -788,7 +788,7 @@ impl ZeroCopyWriter {
             remain -= n as usize;
         }
         Ok(())
-    }
+    }}
 
     fn fallback_write(&mut self, remainder: &[u8]) -> io::Result<()> {
         self.fallback = true;
@@ -876,14 +876,14 @@ struct RowLayout {
 }
 
 #[inline(always)]
-unsafe fn store_block(dst: *mut u8, b: &ConstBlock) {
+unsafe fn store_block(dst: *mut u8, b: &ConstBlock) { unsafe {
     match b.len {
         1 => *dst.add(b.off) = b.val as u8,
         2 => *(dst.add(b.off) as *mut u16) = b.val as u16,
         4 => *(dst.add(b.off) as *mut u32) = b.val as u32,
         _ => *(dst.add(b.off) as *mut u64) = b.val,
     }
-}
+}}
 
 struct RowCore {
     opts:                 Options,
@@ -1324,7 +1324,7 @@ fn can_pair(core: &RowCore) -> bool {
 }
 
 #[target_feature(enable = "sse4.1")]
-unsafe fn hex_offsets_4(off: u64, lut: &[u8; 16]) -> [u64; 4] {
+unsafe fn hex_offsets_4(off: u64, lut: &[u8; 16]) -> [u64; 4] { unsafe {
     let base  = _mm_set1_epi32(off as i32);
     let delta = _mm_setr_epi32(0, 16, 32, 48);
     let x = _mm_add_epi32(base, delta);
@@ -1343,10 +1343,10 @@ unsafe fn hex_offsets_4(off: u64, lut: &[u8; 16]) -> [u64; 4] {
         _mm_cvtsi128_si64(phi) as u64,
         _mm_cvtsi128_si64(_mm_srli_si128(phi, 8)) as u64,
     ]
-}
+}}
 
 #[inline(always)]
-unsafe fn write_hex_offset(dst: *mut u8, off: u64, lut: &[u8; 16]) -> usize {
+unsafe fn write_hex_offset(dst: *mut u8, off: u64, lut: &[u8; 16]) -> usize { unsafe {
     if off <= 0xFFFF_FFFF {
         for k in 0..8 {
             *dst.add(7 - k) = lut[((off >> (k * 4)) & 0xf) as usize];
@@ -1359,10 +1359,10 @@ unsafe fn write_hex_offset(dst: *mut u8, off: u64, lut: &[u8; 16]) -> usize {
         }
         len
     }
-}
+}}
 
 #[inline(always)]
-unsafe fn write_prefix(dst: *mut u8, off: u64, core: &RowCore) -> usize {
+unsafe fn write_prefix(dst: *mut u8, off: u64, core: &RowCore) -> usize { unsafe {
     let mut p = dst;
     let lut = if core.opts.uppercase { HEX_UPPER } else { HEX_LOWER };
     if core.opts.border != BorderStyle::None {
@@ -1431,11 +1431,11 @@ unsafe fn write_prefix(dst: *mut u8, off: u64, core: &RowCore) -> usize {
         }
     }
     p as usize - dst as usize
-}
+}}
 
 #[target_feature(enable = "ssse3,sse4.1")]
 unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
-                     core: &RowCore, layout: &RowLayout) -> usize {
+                     core: &RowCore, layout: &RowLayout) -> usize { unsafe {
     let blocks = (n + 15) / 16;
     let p = dst.add(write_prefix(dst, off, core));
     for cb in &layout.consts {
@@ -1588,13 +1588,13 @@ unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
     }
     }
     (p as usize - dst as usize) + layout.emitted
-}
+}}
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pair(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 2], fast_off: bool,
                       idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
-                      core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+                      core: &RowCore, layout: &RowLayout, row_len: usize) -> usize { unsafe {
     let raw = _mm256_loadu_si256(src as *const __m256i);
     let input = match &core.rev {
         Some(m) => _mm256_shuffle_epi8(
@@ -1663,7 +1663,7 @@ unsafe fn format_pair(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 2], fast
         }
     }
     row_len * 2
-}
+}}
 
 fn pair_masks(layout: &RowLayout) -> ([[i8; 16]; 4], [[u8; 16]; 4]) {
     let mut idx = [[0i8; 16]; 4];
@@ -1678,7 +1678,7 @@ fn pair_masks(layout: &RowLayout) -> ([[i8; 16]; 4], [[u8; 16]; 4]) {
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn format_four_rows(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 4], fast_off: bool,
                            idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
-                           core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+                           core: &RowCore, layout: &RowLayout, row_len: usize) -> usize { unsafe {
     let raw = _mm512_loadu_si512(src as *const _);
     let input = match &core.rev {
         Some(m) => _mm512_shuffle_epi8(
@@ -1761,7 +1761,7 @@ unsafe fn format_four_rows(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 4],
         }
     }
     row_len * 4
-}
+}}
 
 fn fast_offsets_ok(core: &RowCore, off: u64) -> bool {
     core.opts.border == BorderStyle::None
@@ -1771,7 +1771,7 @@ fn fast_offsets_ok(core: &RowCore, off: u64) -> bool {
 }
 
 unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
-                          core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+                          core: &RowCore, layout: &RowLayout, row_len: usize) -> usize { unsafe {
     let lut = if core.opts.uppercase { HEX_UPPER } else { HEX_LOWER };
     let fast_off = fast_offsets_ok(core, off);
     if fast_off {
@@ -1785,7 +1785,7 @@ unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
         hex_offsets_4(off, lut)
     } else { [0; 4] };
     format_pair(dst, src, off, [o8[0], o8[1]], fast_off, &idx, &sp, core, layout, row_len)
-}
+}}
 
 macro_rules! hex_offsets4 {
     ($off:expr, $lutp:expr) => {{
@@ -1830,7 +1830,7 @@ static OCT_SP: [u8; 16] = [32,0,0,0,32,0,0,0,32,0,0,0,32,0,0,0];
 static OCT_MASK_D0: [u8; 16] = [3,7,3,7,3,7,3,7,3,7,3,7,3,7,3,7];
 
 #[target_feature(enable = "ssse3,sse4.1")]
-unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) {
+unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) { unsafe {
     let raw = _mm_loadu_si128(src as *const __m128i);
     let m7 = _mm_set1_epi8(0x07);
     let m0d = _mm_loadu_si128(OCT_MASK_D0.as_ptr() as *const __m128i);
@@ -1856,11 +1856,11 @@ unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) {
         _mm_storeu_si128(p.add(w * 16) as *mut __m128i, v);
     }
     *p.add(64) = b'\n';
-}
+}}
 
 #[target_feature(enable = "ssse3,sse4.1")]
 unsafe fn format_octal_run(dst: *mut u8, src: *const u8, off: u64, rows: usize,
-                           upper: bool, row_len: usize) {
+                           upper: bool, row_len: usize) { unsafe {
     let mut i = 0;
     let lut = if upper { HEX_UPPER.as_ptr() } else { HEX_LOWER.as_ptr() };
     while i + 3 < rows {
@@ -1876,7 +1876,7 @@ unsafe fn format_octal_run(dst: *mut u8, src: *const u8, off: u64, rows: usize,
         format_row_octal(dst.add(i * row_len), src.add(i * 16), o8[0]);
         i += 1;
     }
-}
+}}
 
 macro_rules! fast_pair_min_body {
     ($dst:expr, $src:expr, $o0:expr, $o1:expr, $lutp:expr, $has_ascii:expr, $row_len:expr) => {{
@@ -1934,7 +1934,7 @@ macro_rules! fast_pair_min_body {
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_min_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
-                               lut: &[u8; 16], has_ascii: bool, row_len: usize) {
+                               lut: &[u8; 16], has_ascii: bool, row_len: usize) { unsafe {
     let lutp = lut.as_ptr();
     let mut i = 0;
     while i + 1 < pairs {
@@ -1947,7 +1947,7 @@ unsafe fn format_pairs_min_run(dst: *mut u8, src: *const u8, off: u64, pairs: us
         let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
         fast_pair_min_body!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, has_ascii, row_len);
     }
-}
+}}
 
 macro_rules! fast_pair_head {
     ($src:expr, $lutp:expr) => {{
@@ -2086,7 +2086,7 @@ macro_rules! fast_pair_na {
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
-                           k: CanonKernel, lut: &[u8; 16], row_len: usize) -> usize {
+                           k: CanonKernel, lut: &[u8; 16], row_len: usize) -> usize { unsafe {
     let lutp = lut.as_ptr();
     if k.has_ascii {
         fast_pair_ascii!(dst, src, o8[0], o8[1], lutp, &k, row_len);
@@ -2094,11 +2094,11 @@ unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
         fast_pair_na!(dst, src, o8[0], o8[1], lutp, &k, row_len);
     }
     row_len * 2
-}
+}}
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
-                                lut: &[u8; 16], k: CanonKernel, row_len: usize) {
+                                lut: &[u8; 16], k: CanonKernel, row_len: usize) { unsafe {
     let lutp = lut.as_ptr();
     let mut i = 0;
     if k.has_ascii {
@@ -2124,13 +2124,13 @@ unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: u
             fast_pair_na!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
         }
     }
-}
+}}
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                            idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
                            lut: &[u8; 16],
-                           core: &RowCore, layout: &RowLayout, row_len: usize) {
+                           core: &RowCore, layout: &RowLayout, row_len: usize) { unsafe {
     for k in 0..pairs {
         let o8 = if fast {
             hex_offsets_4(off.wrapping_add((k * 32) as u64), lut)
@@ -2139,13 +2139,13 @@ unsafe fn format_pairs_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                     off.wrapping_add((k * 32) as u64), [o8[0], o8[1]], fast,
                     idx, sp, core, layout, row_len);
     }
-}
+}}
 
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn format_fours_run(dst: *mut u8, src: *const u8, off: u64, quads: usize,
                            idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
                            lut: &[u8; 16],
-                           core: &RowCore, layout: &RowLayout, row_len: usize) {
+                           core: &RowCore, layout: &RowLayout, row_len: usize) { unsafe {
     for k in 0..quads {
         let o8 = if fast {
             hex_offsets_4(off.wrapping_add((k * 64) as u64), lut)
@@ -2154,7 +2154,7 @@ unsafe fn format_fours_run(dst: *mut u8, src: *const u8, off: u64, quads: usize,
                          off.wrapping_add((k * 64) as u64), o8, fast,
                          idx, sp, core, layout, row_len);
     }
-}
+}}
 
 fn _write_hex_group(dst: &mut Vec<u8>, src: &[u8], group: usize, endian: Endian,
                    upper: bool, sep: u8) {
@@ -2485,7 +2485,7 @@ fn read_le_u64(src: &[u8], len: usize, endian: Endian) -> u64 {
 }
 
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
-unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool) {
+unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool) { unsafe {
     let lut = if upper {
         _mm_loadu_si128(HEX_UPPER.as_ptr() as *const __m128i)
     } else {
@@ -2503,7 +2503,7 @@ unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool)
         _mm_storeu_si128(dst.add(i * 32) as *mut __m128i, plo);
         _mm_storeu_si128(dst.add(i * 32 + 16) as *mut __m128i, phi);
     }
-}
+}}
 
 fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
     let blocks = data.len() / 16;
