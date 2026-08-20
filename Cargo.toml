@@ -2,7 +2,7 @@
 name = "fasthex"
 version = "0.3.5"
 description = "a very fast hex dumper"
-license = "GPL-3.0-or-later"
+license = "Apache-2.0"
 repository = "https://github.com/CallMeAlphabet/fasthex"
 edition = "2021"
 
