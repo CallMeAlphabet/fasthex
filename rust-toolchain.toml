@@ -1,1 +1,2 @@
-[toolchain]\nchannel = "nightly"
+[toolchain]
+channel = "nightly"
