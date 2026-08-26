@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 //! Copyright 2026 CallMeAlphabet (ItzAlphabet)
 //!
 //! Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +33,7 @@
 use clihelp::{HelpPage, Row, Section};
 use memmap2::Mmap;
 use rayon::prelude::*;
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -48,6 +50,61 @@ const _CHUNK_ROWS: usize = (64 * 1024 * 1024) / 76; // recalculated per-mode at 
 
 static HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 static HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+use std::simd::Simd;
+
+/// Portable nibble LUT hex encode of 16 bytes → 32 ASCII digits.
+/// LLVM lowers this to AVX2/SSSE3 on x86_64 and NEON `tbl` on aarch64.
+#[inline(always)]
+fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
+    type V = Simd<u8, 16>;
+    let v = V::from_slice(&src[..16]);
+    let lo = v & V::splat(0x0f);
+    let hi = v >> 4;
+    let lutv = V::from_array(*lut);
+    let hlo = lutv.swizzle_dyn(lo);
+    let hhi = lutv.swizzle_dyn(hi);
+    let mut out = [0u8; 32];
+    for i in 0..16 {
+        out[i * 2] = hhi[i];
+        out[i * 2 + 1] = hlo[i];
+    }
+    dst[..32].copy_from_slice(&out);
+}
+
+#[inline]
+fn cpu_avx2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+#[inline]
+fn cpu_sse41() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+#[inline]
+fn cpu_avx512() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
 
 // CP437 table (256 entries, index = byte value)
 static CP437: [char; 256] = [
@@ -728,6 +785,12 @@ struct ZeroCopyWriter {
 
 impl ZeroCopyWriter {
     fn new() -> io::Result<Self> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Ok(Self { pipe_r: -1, pipe_w: -1, stdout: libc::STDOUT_FILENO, fallback: true });
+        }
+        #[cfg(target_os = "linux")]
+        {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let ok = unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) == 0 };
         let mode = if ok { st.st_mode & libc::S_IFMT } else { 0 };
@@ -740,13 +803,18 @@ impl ZeroCopyWriter {
         }
         unsafe { libc::fcntl(fds[1], libc::F_SETPIPE_SZ, PIPE_SIZE_HINT); }
         Ok(Self { pipe_r: fds[0], pipe_w: fds[1], stdout: libc::STDOUT_FILENO, fallback: false })
+        }
     }
 
     fn write_chunk(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.fallback { return self.write_fallback(buf); }
-        unsafe { self.write_zero_copy(buf) }
+        #[cfg(target_os = "linux")]
+        { return unsafe { self.write_zero_copy(buf) }; }
+        #[cfg(not(target_os = "linux"))]
+        { return self.write_fallback(buf); }
     }
 
+    #[cfg(target_os = "linux")]
     unsafe fn write_zero_copy(&mut self, buf: &[u8]) -> io::Result<()> { unsafe {
         let mut pos = 0usize;
         while pos < buf.len() {
@@ -777,6 +845,7 @@ impl ZeroCopyWriter {
         Ok(())
     }}
 
+    #[cfg(target_os = "linux")]
     unsafe fn splice_out(&mut self, len: usize) -> io::Result<()> { unsafe {
         let mut remain = len;
         while remain > 0 {
@@ -819,7 +888,8 @@ impl ZeroCopyWriter {
 
 impl Drop for ZeroCopyWriter {
     fn drop(&mut self) {
-        unsafe { libc::close(self.pipe_r); libc::close(self.pipe_w); }
+        if self.pipe_r >= 0 { unsafe { libc::close(self.pipe_r); } }
+        if self.pipe_w >= 0 { unsafe { libc::close(self.pipe_w); } }
     }
 }
 
@@ -1323,6 +1393,7 @@ fn can_pair(core: &RowCore) -> bool {
         && core.full.colored.is_none()
 }
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.1")]
 unsafe fn hex_offsets_4(off: u64, lut: &[u8; 16]) -> [u64; 4] { unsafe {
     let base  = _mm_set1_epi32(off as i32);
@@ -1433,6 +1504,7 @@ unsafe fn write_prefix(dst: *mut u8, off: u64, core: &RowCore) -> usize { unsafe
     p as usize - dst as usize
 }}
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3,sse4.1")]
 unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
                      core: &RowCore, layout: &RowLayout) -> usize { unsafe {
@@ -1590,7 +1662,9 @@ unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
     (p as usize - dst as usize) + layout.emitted
 }}
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pair(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 2], fast_off: bool,
                       idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
@@ -1675,6 +1749,7 @@ fn pair_masks(layout: &RowLayout) -> ([[i8; 16]; 4], [[u8; 16]; 4]) {
     (idx, sp)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn format_four_rows(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 4], fast_off: bool,
                            idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
@@ -1770,6 +1845,7 @@ fn fast_offsets_ok(core: &RowCore, off: u64) -> bool {
         && off < 0xFFFF_FFF0
 }
 
+#[cfg(target_arch = "x86_64")]
 unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
                           core: &RowCore, layout: &RowLayout, row_len: usize) -> usize { unsafe {
     let lut = if core.opts.uppercase { HEX_UPPER } else { HEX_LOWER };
@@ -1829,6 +1905,7 @@ static OCT_IDX2: [[i8; 16]; 4] = [
 static OCT_SP: [u8; 16] = [32,0,0,0,32,0,0,0,32,0,0,0,32,0,0,0];
 static OCT_MASK_D0: [u8; 16] = [3,7,3,7,3,7,3,7,3,7,3,7,3,7,3,7];
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3,sse4.1")]
 unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) { unsafe {
     let raw = _mm_loadu_si128(src as *const __m128i);
@@ -1858,6 +1935,7 @@ unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) { unsafe {
     *p.add(64) = b'\n';
 }}
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3,sse4.1")]
 unsafe fn format_octal_run(dst: *mut u8, src: *const u8, off: u64, rows: usize,
                            upper: bool, row_len: usize) { unsafe {
@@ -1932,6 +2010,7 @@ macro_rules! fast_pair_min_body {
     }};
 }
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_min_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                                lut: &[u8; 16], has_ascii: bool, row_len: usize) { unsafe {
@@ -2084,6 +2163,7 @@ macro_rules! fast_pair_na {
     }};
 }
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
                            k: CanonKernel, lut: &[u8; 16], row_len: usize) -> usize { unsafe {
@@ -2096,6 +2176,7 @@ unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
     row_len * 2
 }}
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                                 lut: &[u8; 16], k: CanonKernel, row_len: usize) { unsafe {
@@ -2126,6 +2207,7 @@ unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: u
     }
 }}
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                            idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
@@ -2141,6 +2223,7 @@ unsafe fn format_pairs_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
     }
 }}
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 unsafe fn format_fours_run(dst: *mut u8, src: *const u8, off: u64, quads: usize,
                            idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
@@ -2155,6 +2238,77 @@ unsafe fn format_fours_run(dst: *mut u8, src: *const u8, off: u64, quads: usize,
                          idx, sp, core, layout, row_len);
     }
 }}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
+                     core: &RowCore, layout: &RowLayout) -> usize {
+    let _ = (src, n);
+    let mut v = Vec::new();
+    let slice = std::slice::from_raw_parts(src, n);
+    format_row_generic(&mut v, slice, off, &core.opts);
+    let plen = write_prefix(dst, off, core);
+    // generic includes prefix; just copy whole row
+    let _ = plen;
+    std::ptr::copy_nonoverlapping(v.as_ptr(), dst, v.len());
+    let _ = layout;
+    v.len()
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_two_rows(dst: *mut u8, src: *const u8, off: u64,
+                          core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+    format_row(dst, src, off, 16, core, layout);
+    format_row(dst.add(row_len), src.add(16), off.wrapping_add(16), 16, core, layout);
+    row_len * 2
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_pairs_min_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                               lut: &[u8; 16], has_ascii: bool, row_len: usize) {
+    let _ = (dst, src, off, pairs, lut, has_ascii, row_len);
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                                lut: &[u8; 16], k: CanonKernel, row_len: usize) {
+    let _ = (dst, src, off, pairs, lut, k, row_len);
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_pairs_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                           idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
+                           lut: &[u8; 16],
+                           core: &RowCore, layout: &RowLayout, row_len: usize) {
+    let _ = (dst, src, off, pairs, idx, sp, fast, lut, core, layout, row_len);
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_fours_run(dst: *mut u8, src: *const u8, off: u64, quads: usize,
+                           idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4], fast: bool,
+                           lut: &[u8; 16],
+                           core: &RowCore, layout: &RowLayout, row_len: usize) {
+    let _ = (dst, src, off, quads, idx, sp, fast, lut, core, layout, row_len);
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_octal_run(dst: *mut u8, src: *const u8, off: u64, rows: usize,
+                           upper: bool, row_len: usize) {
+    let _ = (dst, src, off, rows, upper, row_len);
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn format_pair(dst: *mut u8, src: *const u8, off: u64, o8: [u64; 2], fast_off: bool,
+                      idx: &[[i8; 16]; 4], sp: &[[u8; 16]; 4],
+                      core: &RowCore, layout: &RowLayout, row_len: usize) -> usize {
+    let _ = (dst, src, off, o8, fast_off, idx, sp, core, layout, row_len);
+    0
+}
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn hex_offsets_4(_off: u64, _lut: &[u8; 16]) -> [u64; 4] { [0; 4] }
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool) {
+    let lut = if upper { HEX_UPPER } else { HEX_LOWER };
+    for i in 0..blocks {
+        encode_hex16_portable(
+            unsafe { std::slice::from_raw_parts(src.add(i * 16), 16) },
+            lut,
+            unsafe { std::slice::from_raw_parts_mut(dst.add(i * 32), 32) },
+        );
+    }
+}
 
 fn _write_hex_group(dst: &mut Vec<u8>, src: &[u8], group: usize, endian: Endian,
                    upper: bool, sep: u8) {
@@ -2484,24 +2638,16 @@ fn read_le_u64(src: &[u8], len: usize, endian: Endian) -> u64 {
     v
 }
 
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool) { unsafe {
-    let lut = if upper {
-        _mm_loadu_si128(HEX_UPPER.as_ptr() as *const __m128i)
-    } else {
-        _mm_loadu_si128(HEX_LOWER.as_ptr() as *const __m128i)
-    };
-    let m0f = _mm_set1_epi8(0x0f);
+    let lut = if upper { HEX_UPPER } else { HEX_LOWER };
     for i in 0..blocks {
-        let raw = _mm_loadu_si128(src.add(i * 16) as *const __m128i);
-        let lo = _mm_and_si128(raw, m0f);
-        let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m0f);
-        let hlo = _mm_shuffle_epi8(lut, lo);
-        let hhi = _mm_shuffle_epi8(lut, hi);
-        let plo = _mm_unpacklo_epi8(hhi, hlo);
-        let phi = _mm_unpackhi_epi8(hhi, hlo);
-        _mm_storeu_si128(dst.add(i * 32) as *mut __m128i, plo);
-        _mm_storeu_si128(dst.add(i * 32 + 16) as *mut __m128i, phi);
+        encode_hex16_portable(
+            std::slice::from_raw_parts(src.add(i * 16), 16),
+            lut,
+            std::slice::from_raw_parts_mut(dst.add(i * 32), 32),
+        );
     }
 }}
 
@@ -3258,6 +3404,7 @@ impl Read for MultiReader {
 }
 
 fn main() -> io::Result<()> {
+    #[cfg(unix)]
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
 
     let opts = match parse_args() {
@@ -3327,13 +3474,10 @@ fn main() -> io::Result<()> {
             }
 
             let simd_ok = is_simd_eligible(&opts, do_color);
-            let avx2_hw = is_x86_feature_detected!("avx2");
+            let avx2_hw = cpu_avx2();
             let use_avx2 = simd_ok && avx2_hw;
-            let use_simd = simd_ok && (use_avx2 ||
-                (is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")));
-            let use_avx512 = use_simd
-                && is_x86_feature_detected!("avx512f")
-                && is_x86_feature_detected!("avx512bw");
+            let use_simd = simd_ok && (use_avx2 || cpu_sse41());
+            let use_avx512 = use_simd && cpu_avx512();
 
             let colored_simd = do_color
                 && opts.scheme == ColorScheme::Default
@@ -3395,9 +3539,8 @@ fn main() -> io::Result<()> {
     }
 
     let simd_ok   = is_simd_eligible(&opts, do_color);
-    let use_avx2  = simd_ok && is_x86_feature_detected!("avx2");
-    let use_simd  = simd_ok && (use_avx2 ||
-        (is_x86_feature_detected!("ssse3") && is_x86_feature_detected!("sse4.1")));
+    let use_avx2  = simd_ok && cpu_avx2();
+    let use_simd  = simd_ok && (use_avx2 || cpu_sse41());
 
     run_streaming(&opts, &mut reader, do_color, use_simd, use_avx2)
 }
@@ -3483,6 +3626,7 @@ fn run_parallel_scalar(
         let buf = vec![0u8; buf_cap];
         #[cfg(unix)]
         unsafe {
+            #[cfg(target_os = "linux")]
             libc::madvise(buf.as_ptr() as *mut libc::c_void, buf.len(), libc::MADV_HUGEPAGE);
         }
         send_free.send(buf).unwrap();
@@ -3686,6 +3830,7 @@ fn run_parallel_mmap(
         let buf = vec![0u8; buf_cap];
         #[cfg(unix)]
         unsafe {
+            #[cfg(target_os = "linux")]
             libc::madvise(buf.as_ptr() as *mut libc::c_void, buf.len(), libc::MADV_HUGEPAGE);
         }
         send_free.send(buf).unwrap();
@@ -3714,7 +3859,7 @@ fn run_parallel_mmap(
         && !opts.no_position
         && !opts.offset_dec
         && start_off.wrapping_add(file_sz as u64) <= 0xFFFF_FFFF;
-    let use_octal = octal_all && is_x86_feature_detected!("avx2");
+    let use_octal = octal_all && cpu_avx2();
     let min_all = opts.minimal
         && width == 16
         && opts.table == CharTable::Ascii
@@ -4484,18 +4629,4 @@ fn run_streaming(
     }
 
     out.flush()
-                    }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+}
