@@ -131,3 +131,4 @@ jobs:
           name: Latest build
           make_latest: true
           files: artifacts/*
+
