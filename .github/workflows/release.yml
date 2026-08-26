@@ -7,11 +7,13 @@ on:
     paths-ignore:
       - '**.md'
       - 'LICENSE'
-      - '.*'
-      - '.*/**'
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -40,7 +42,7 @@ jobs:
             use_cross: true
 
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             suffix: x86_64-macos
             use_cross: false
 
@@ -55,9 +57,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
+          components: rust-src
 
       - name: Install cross
         if: matrix.use_cross
@@ -103,6 +106,7 @@ jobs:
 
   release:
     needs: build
+    if: ${{ always() && !cancelled() && needs.build.result != 'cancelled' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -113,6 +117,7 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+          if-no-files-found: warn
 
       - name: Move rolling tag
         run: |
