@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-v2-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
