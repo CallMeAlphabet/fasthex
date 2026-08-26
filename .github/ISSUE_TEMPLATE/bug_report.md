@@ -1,3 +1,4 @@
+---
 name: Bug report
 about: Something is broken or producing wrong output
 labels: bug
