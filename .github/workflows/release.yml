@@ -119,15 +119,11 @@ jobs:
           merge-multiple: true
           if-no-files-found: warn
 
-      - name: Move rolling tag
-        run: |
-          git tag -f latest
-          git push origin latest --force
-
       - name: Create/update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
+          target_commitish: ${{ github.sha }}
           name: Latest build
           make_latest: true
           files: artifacts/*
