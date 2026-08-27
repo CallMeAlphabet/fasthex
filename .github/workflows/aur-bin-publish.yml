@@ -1,0 +1,53 @@
+name: aur-bin-publish
+
+# Runs after the release workflow has finished uploading binaries, so
+# the AUR package is never bumped before the assets it points at exist.
+on:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+
+jobs:
+  aur-bin-publish:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install tools
+        run: pacman -Sy --noconfirm base-devel git openssh pacman-contrib
+
+      - name: Push fasthex-bin to AUR
+        run: |
+          set -e
+          if [ "${{ github.event.workflow_run.conclusion }}" != success ]; then
+            echo "release did not succeed - skipping"
+            exit 0
+          fi
+
+          mkdir -p /tmp/ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > /tmp/ssh/aur_key
+          chmod 600 /tmp/ssh/aur_key
+          export GIT_SSH_COMMAND="ssh -i /tmp/ssh/aur_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+          git clone ssh://aur@aur.archlinux.org/fasthex-bin.git /tmp/aur-bin
+          cd /tmp/aur-bin
+
+          NEW_VERSION=${{ github.event.workflow_run.run_number }}
+          sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+
+          useradd -m builduser
+          chown -R builduser:builduser /tmp/aur-bin
+          git config --global --add safe.directory /tmp/aur-bin
+          su builduser -c "cd /tmp/aur-bin && updpkgsums && makepkg --printsrcinfo > .SRCINFO"
+
+          git config user.name "CallMeAlphabet"
+          git config user.email "sigma.alphabet@proton.me"
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No changes to push"
+          else
+            git commit -m "Auto-bump to build $NEW_VERSION"
+            git push
+          fi
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
