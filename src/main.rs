@@ -13,7 +13,7 @@
 //! See the License for the specific language governing permissions and
 //! limitations under the License.
 
-//! fasthex 0.3.5 – a very fast hex dumper
+//! fasthex – a very fast hex dumper
 //!
 //! Speed notes:
 //!   1. mmap + rayon parallel formatting in 64 MiB chunks.
@@ -349,7 +349,12 @@ fn print_help() {
 }
 
 pub fn print_help_body(on: bool) {
-    let mut page = HelpPage::new("fasthex 0.3.5 - a very fast hex dumper")
+    let mut page = HelpPage::new(format!(
+        "{} {} - {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_DESCRIPTION")
+    ))
         .usage("fasthex [options] [file]...")
         .usage("fasthex -r [options] [file] [-j <offset>]")
         .usage("fasthex [options] -          read from stdin explicitly")
@@ -431,7 +436,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
 
             match key {
                 "help"    => { print_help(); std::process::exit(0); }
-                "version" => { println!("0.3.5"); std::process::exit(0); }
+                "version" => { println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")); std::process::exit(0); }
                 "hex"           => opts.mode = DisplayMode::OneByteHex,
                 "hex-wide"      => opts.mode = DisplayMode::TwoByteHex,
                 "octal"         => opts.mode = DisplayMode::OneByteOctal,
@@ -531,7 +536,7 @@ fn parse_args_from(raw: &[String]) -> Result<Options, String> {
             while j < bytes.len() {
                 match bytes[j] {
                     b'h' => { print_help(); std::process::exit(0); }
-                    b'v' => { println!("0.3.5"); std::process::exit(0); }
+                    b'v' => { println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")); std::process::exit(0); }
                     b'x' => opts.mode = DisplayMode::OneByteHex,
                     b'X' => opts.mode = DisplayMode::TwoByteHex,
                     b'o' => opts.mode = DisplayMode::OneByteOctal,
