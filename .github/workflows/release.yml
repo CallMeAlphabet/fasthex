@@ -119,6 +119,11 @@ jobs:
           merge-multiple: true
           if-no-files-found: warn
 
+      - name: Move latest tag to this commit
+        run: |
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin refs/tags/latest
+
       - name: Create/update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
