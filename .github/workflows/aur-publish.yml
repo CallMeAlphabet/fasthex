@@ -39,8 +39,8 @@ jobs:
           NEW_VERSION=$GITHUB_RUN_NUMBER
           sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/RUSTUP_TOOLCHAIN=stable/RUSTUP_TOOLCHAIN=nightly/" PKGBUILD
-          sed -i "s/makedepends=('cargo')/makedepends=('rustup')/" PKGBUILD
+          sed -i "s/TOOLCHAIN=stable/TOOLCHAIN=nightly/" PKGBUILD
+          sed -i "s/'cargo'/'rustup'/" PKGBUILD
 
           useradd -m builduser
           chown -R builduser:builduser /tmp/aur-repo
