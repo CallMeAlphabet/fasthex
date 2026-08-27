@@ -39,6 +39,7 @@ jobs:
           NEW_VERSION=$GITHUB_RUN_NUMBER
           sed -i "s/^pkgver=.*/pkgver=$NEW_VERSION/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s|^_commit=.*|_commit=$GITHUB_SHA|" PKGBUILD
           sed -i "s/TOOLCHAIN=stable/TOOLCHAIN=nightly/" PKGBUILD
           sed -i "s/'cargo'/'rustup'/" PKGBUILD
 
