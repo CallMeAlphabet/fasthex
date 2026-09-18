@@ -1,4 +1,6 @@
-#![feature(portable_simd)]
+// `std::simd` is nightly-only (`portable_simd`, rust-lang/rust#86656), so the
+// gate is applied by `build.rs` only when the active toolchain accepts it.
+#![cfg_attr(simd_portable, feature(portable_simd))]
 //! Copyright 2026 CallMeAlphabet (ItzAlphabet)
 //!
 //! Licensed under the Apache License, Version 2.0 (the "License");
@@ -51,10 +53,12 @@ const _CHUNK_ROWS: usize = (64 * 1024 * 1024) / 76; // recalculated per-mode at 
 static HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 static HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
+#[cfg(simd_portable)]
 use std::simd::Simd;
 
 /// Portable nibble LUT hex encode of 16 bytes → 32 ASCII digits.
 /// LLVM lowers this to AVX2/SSSE3 on x86_64 and NEON `tbl` on aarch64.
+#[cfg(simd_portable)]
 #[inline(always)]
 fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
     type V = Simd<u8, 16>;
@@ -70,6 +74,18 @@ fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
         out[i * 2 + 1] = hlo[i];
     }
     dst[..32].copy_from_slice(&out);
+}
+
+/// Scalar nibble LUT hex encode, used when the toolchain has no `std::simd`.
+/// Same output as the vector variant above, byte at a time.
+#[cfg(not(simd_portable))]
+#[inline(always)]
+fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
+    for i in 0..16 {
+        let b = src[i];
+        dst[i * 2] = lut[(b >> 4) as usize];
+        dst[i * 2 + 1] = lut[(b & 0x0f) as usize];
+    }
 }
 
 #[inline]
@@ -954,9 +970,9 @@ struct RowLayout {
 unsafe fn store_block(dst: *mut u8, b: &ConstBlock) { unsafe {
     match b.len {
         1 => *dst.add(b.off) = b.val as u8,
-        2 => *(dst.add(b.off) as *mut u16) = b.val as u16,
-        4 => *(dst.add(b.off) as *mut u32) = b.val as u32,
-        _ => *(dst.add(b.off) as *mut u64) = b.val,
+        2 => std::ptr::write_unaligned(dst.add(b.off) as *mut u16, b.val as u16),
+        4 => std::ptr::write_unaligned(dst.add(b.off) as *mut u32, b.val as u32),
+        _ => std::ptr::write_unaligned(dst.add(b.off) as *mut u64, b.val),
     }
 }}
 
@@ -1924,7 +1940,7 @@ unsafe fn format_row_octal(dst: *mut u8, src: *const u8, o8: u64) { unsafe {
     let c1 = _mm_shuffle_epi8(lut, d1);
     let c2 = _mm_shuffle_epi8(lut, d2);
     std::ptr::write_unaligned(dst as *mut u64, o8);
-    *(dst.add(8) as *mut u16) = 0x203a;
+    std::ptr::write_unaligned(dst.add(8) as *mut u16, 0x203a);
     let p = dst.add(10);
     let sp = _mm_loadu_si128(OCT_SP.as_ptr() as *const __m128i);
     for w in 0..4 {
@@ -2057,10 +2073,10 @@ macro_rules! fast_pair_ascii {
         let asc = _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr);
         let d0 = $dst;
         std::ptr::write_unaligned(d0 as *mut u64, $o0);
-        *(d0.add(8) as *mut u16) = 0x203a;
+        std::ptr::write_unaligned(d0.add(8) as *mut u16, 0x203a);
         let d1 = d0.add($row_len);
         std::ptr::write_unaligned(d1 as *mut u64, $o1);
-        *(d1.add(8) as *mut u16) = 0x203a;
+        std::ptr::write_unaligned(d1.add(8) as *mut u16, 0x203a);
         let p0 = d0.add(10);
         let plo0 = _mm256_castsi256_si128(plo);
         let phi0 = _mm256_castsi256_si128(phi);
@@ -2086,7 +2102,7 @@ macro_rules! fast_pair_ascii {
         let tu = _mm_or_si128(
             _mm_shuffle_epi8(asc0, _mm_loadu_si128($k.tu_idx.as_ptr() as *const __m128i)),
             _mm_loadu_si128($k.tu_sp.as_ptr() as *const __m128i));
-        *(p0.add(64) as *mut u32) = _mm_cvtsi128_si64(tu) as u32;
+        std::ptr::write_unaligned(p0.add(64) as *mut u32, _mm_cvtsi128_si64(tu) as u32);
         *p0.add(68) = $k.nl;
         let p1 = d1.add(10);
         let plo1 = _mm256_extracti128_si256(plo, 1);
@@ -2113,7 +2129,7 @@ macro_rules! fast_pair_ascii {
         let gu = _mm_or_si128(
             _mm_shuffle_epi8(asc1, _mm_loadu_si128($k.tu_idx.as_ptr() as *const __m128i)),
             _mm_loadu_si128($k.tu_sp.as_ptr() as *const __m128i));
-        *(p1.add(64) as *mut u32) = _mm_cvtsi128_si64(gu) as u32;
+        std::ptr::write_unaligned(p1.add(64) as *mut u32, _mm_cvtsi128_si64(gu) as u32);
         *p1.add(68) = $k.nl;
     }};
 }
@@ -2123,10 +2139,10 @@ macro_rules! fast_pair_na {
         let (_raw, plo, phi) = fast_pair_head!($src, $lutp);
         let d0 = $dst;
         std::ptr::write_unaligned(d0 as *mut u64, $o0);
-        *(d0.add(8) as *mut u16) = 0x203a;
+        std::ptr::write_unaligned(d0.add(8) as *mut u16, 0x203a);
         let d1 = d0.add($row_len);
         std::ptr::write_unaligned(d1 as *mut u64, $o1);
-        *(d1.add(8) as *mut u16) = 0x203a;
+        std::ptr::write_unaligned(d1.add(8) as *mut u16, 0x203a);
         let p0 = d0.add(10);
         let plo0 = _mm256_castsi256_si128(plo);
         let phi0 = _mm256_castsi256_si128(phi);
