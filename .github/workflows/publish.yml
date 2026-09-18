@@ -22,17 +22,48 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # The pin in rust-toolchain.toml is nightly for the SIMD kernel, and a
+      # `cargo` proxy run inside this checkout would honour it. Force stable so
+      # the verification below compiles with the same channel `cargo install
+      # fasthex` uses for people without rustup-nightly.
       - name: Set auto-incrementing patch version
+        env:
+          RUSTUP_TOOLCHAIN: stable
         run: |
           BASE_VERSION=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2 | cut -d. -f1,2)
           NEW_VERSION="$BASE_VERSION.$GITHUB_RUN_NUMBER"
           sed -i "0,/^version = \".*\"/s//version = \"$NEW_VERSION\"/" Cargo.toml
           echo "Publishing version: $NEW_VERSION"
+          echo "NEW_VERSION=$NEW_VERSION" >> "$GITHUB_ENV"
 
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
+      # `--no-verify` was added when the crate needed `-Z build-std`, which cargo
+      # cannot verify on this channel. Nothing here needs nightly any more, so
+      # let `cargo publish` build the packaged crate: a release that stable
+      # cannot compile must not reach the registry, because it stays installable
+      # forever for anyone whose index cache still resolves to it.
       - name: Publish to crates.io
-        run: cargo publish --allow-dirty --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          RUSTUP_TOOLCHAIN: stable
+        run: cargo publish --allow-dirty
+
+      # The publish above builds the *repo* copy. Re-install from the registry
+      # and run it, so the artifact users actually get is the thing being tested.
+      # A private CARGO_HOME keeps a warm index cache from resolving an older
+      # version - the exact failure mode that left broken releases installable.
+      - name: Smoke-test the published crate on stable
+        env:
+          RUSTUP_TOOLCHAIN: stable
+          CRATE: fasthex
+        run: |
+          export CARGO_HOME="$RUNNER_TEMP/smoke-home"
+          cargo install --force --locked --debug "$CRATE@$NEW_VERSION" \
+            --root "$RUNNER_TEMP/smoke-root"
+          BIN="$RUNNER_TEMP/smoke-root/bin/$CRATE"
+          "$BIN" --version
+          mkdir -p "$RUNNER_TEMP/smoke" && cd "$RUNNER_TEMP/smoke"
+          head -c 4096 /dev/urandom > sample.bin
+          diff <("$BIN" -p sample.bin | tr -d '\n') <(od -An -tx1 -v sample.bin | tr -d ' \n')
