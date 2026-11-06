@@ -6,7 +6,7 @@ fasthex — a very fast hex dumper (written in Rust), with all features that oth
 
 - [Quick Start](#quick-start)
 - [Benchmarks](#benchmarks)
-- [Uninstall](#Uninstall)
+- [Uninstall](#uninstall)
 - [Usage](#usage)
 - [Features](#features)
 - [Example Output](#example-output)
@@ -44,13 +44,13 @@ These are Hyperfine wall-clock means with stdout redirected to `/dev/null`. The 
 
 | File | Mode | Tool | Mean wall time | fasthex speedup |
 |---|---|---|---:|---:|
-| random-5GiB.bin | canonical | fasthex 0.3.7 | **3.553 ± 0.038 s** | — |
+| **random-5GiB.bin** | **canonical** | **fasthex 0.3.7** | **3.553 ± 0.038 s** | **—** |
 | random-5GiB.bin | canonical | xxd | 219.292 ± 1.465 s | 61.7× |
-| fasthex-16MiB.bin | canonical | fasthex 0.3.7 | **49.6 ± 17.0 ms** | — |
+| **fasthex-16MiB.bin** | **canonical** | **fasthex 0.3.7** | **49.6 ± 17.0 ms** | **—** |
 | fasthex-16MiB.bin | canonical | xxd | 1280.6 ± 344.3 ms | 25.8× |
 | fasthex-16MiB.bin | canonical | hexdump | 4368.4 ± 159.3 ms | 88.1× |
 | fasthex-16MiB.bin | canonical | hexyl | 719.3 ± 66.7 ms | 14.5× |
-| fasthex-16MiB.bin | plain hex | fasthex 0.3.7 | **54.1 ± 20.9 ms** | — |
+| **fasthex-16MiB.bin** | **plain hex** | **fasthex 0.3.7** | **54.1 ± 20.9 ms** | **—** |
 | fasthex-16MiB.bin | plain hex | xxd | 319.1 ± 54.4 ms | 5.9× |
 
 Reproduce with Hyperfine:
