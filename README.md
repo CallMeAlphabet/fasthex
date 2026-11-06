@@ -16,8 +16,7 @@ fasthex — a very fast hex dumper (written in Rust), with all features that oth
 ## Quick Start
 - **On Arch**
 ```bash
-paru -S fasthex 
-# or fasthex-bin for a prebuilt release
+paru -S fasthex
 ```
 - **Non-arch**
 ```bash
@@ -36,30 +35,33 @@ cargo install fasthex
 > ```
 
 ```bash
-# Use it!
 fasthex /path/to/file
 ```
 
 ## Benchmarks
 
-### Benchmark 1: 1.5 GiB file (output to /dev/null)
+These are Hyperfine wall-clock means with stdout redirected to `/dev/null`. The 5 GiB canonical case used 2 runs per tool, the 16 MiB canonical case used 3, and the 16 MiB plain case used 10. Times are reported as mean ± standard deviation.
 
-| Tool | Time | Speed vs fasthex |
-|------|------|------------------|
-| **fasthex** | **0.78s** | **1x (baseline)** |
-| xxd | 43.62s | 55.5x slower |
-| hexyl¹ | 53.14s | 67.6x slower |
-| hexyl | 104.93s | 133.5x slower |
-| hexdump | 116.03s | 147.5x slower |
+| File | Mode | Tool | Mean wall time | fasthex speedup |
+|---|---|---|---:|---:|
+| random-5GiB.bin | canonical | fasthex 0.3.7 | **3.553 ± 0.038 s** | — |
+| random-5GiB.bin | canonical | xxd | 219.292 ± 1.465 s | 61.7× |
+| fasthex-16MiB.bin | canonical | fasthex 0.3.7 | **49.6 ± 17.0 ms** | — |
+| fasthex-16MiB.bin | canonical | xxd | 1280.6 ± 344.3 ms | 25.8× |
+| fasthex-16MiB.bin | canonical | hexdump | 4368.4 ± 159.3 ms | 88.1× |
+| fasthex-16MiB.bin | canonical | hexyl | 719.3 ± 66.7 ms | 14.5× |
+| fasthex-16MiB.bin | plain hex | fasthex 0.3.7 | **54.1 ± 20.9 ms** | — |
+| fasthex-16MiB.bin | plain hex | xxd | 319.1 ± 54.4 ms | 5.9× |
 
-**¹ *--color=never was used to avoid colors.***
+Reproduce with Hyperfine:
 
-### Benchmark 2: 69 GiB file (output to /dev/null)
+```bash
+hyperfine --shell=default --warmup 0 --runs 2   './target/release/fasthex "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'   'xxd "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
 
-| Tool | Time |
-|------|------|
-| fasthex | ~1m |
-| hexyl | ~1h 30m |
+hyperfine --shell=default --warmup 1 --runs 3   './target/release/fasthex /tmp/fasthex-16MiB.bin > /dev/null'   'xxd /tmp/fasthex-16MiB.bin > /dev/null'   'hexdump -v -C /tmp/fasthex-16MiB.bin > /dev/null'   'hexyl --color=never --border=none --character-table=ascii -v /tmp/fasthex-16MiB.bin > /dev/null'
+
+hyperfine --shell=default --warmup 1 --runs 10   './target/release/fasthex -p /tmp/fasthex-16MiB.bin > /dev/null'   'xxd -ps /tmp/fasthex-16MiB.bin > /dev/null'
+```
 
 ## Uninstall
 
@@ -72,35 +74,27 @@ cargo uninstall fasthex
 ### Basic usage
 
 ```bash
-# Display a file
 fasthex /path/to/file
 
-# Pipe it (faster with zero-copy output)
 fasthex /path/to/file > output.txt
 
-# Skip first 1 KiB and read only 512 bytes
 fasthex -s 1KiB -n 512 /path/to/file
 
-# Display with colors
 fasthex --color=always /path/to/file
 
-# Binary display
 fasthex -b /path/to/file
 ```
 
 ### Common use cases
 
 ```bash
-# Test on RAM disk (avoids SSD/HDD bottleneck)
 sudo mkdir -p /mnt/ramdisk
 sudo mount -t tmpfs -o size=2G tmpfs /mnt/ramdisk
 cp /path/to/file /mnt/ramdisk
 time fasthex /mnt/ramdisk/file > /dev/null
 
-# Measure time with `time`
 time fasthex /path/to/file
 
-# Interactive viewing
 fasthex /path/to/file | less
 ```
 
@@ -128,8 +122,8 @@ fasthex /path/to/file | less
 00000010: 03 00 3e 00 01 00 00 00  f0 54 00 00 00 00 00 00  |..>......T......|
 00000020: 40 00 00 00 00 00 00 00  a8 73 02 00 00 00 00 00  |@........s......|
 00000030: 00 00 00 00 40 00 38 00  0e 00 40 00 1c 00 1b 00  |....@.8...@.....|
-00000040: 06 00 00 00 04 00 00 00  40 00 00 00 00 00 00 00  |........@.......|
-00000050: 40 00 00 00 00 00 00 00  40 00 00 00 00 00 00 00  |@.......@.......|
+00000040: 06 00 00 00 04 00 00 00  40 00 00 00 00 00 00 00  |@.......@.......|
+00000050: 40 00 00 00 00 00 00 00  f0 54 00 00 00 00 00 00  |@...T...........|
 00000060: 10 03 00 00 00 00 00 00  10 03 00 00 00 00 00 00  |................|
 00000070: 08 00 00 00 00 00 00 00  03 00 00 00 04 00 00 00  |................|
 00000080: 74 03 00 00 00 00 00 00  74 03 00 00 00 00 00 00  |t.......t.......|
@@ -153,11 +147,10 @@ fasthex /path/to/file | less
      if splice rejects the stdout fd (e.g. a tty).
   6. Streaming (stdin) path uses a 4 MiB write buffer.
 
-
 ### Full Help
 
 ```
-fasthex 0.3.0 - a very fast hex dumper
+fasthex 0.3.7 - a very fast hex dumper
 
 Usage:
   fasthex [options] [file]...
@@ -190,6 +183,7 @@ LAYOUT
   -B, --border <STYLE>        none | ascii | unicode  (default: none)
   -A, --no-ascii              hide the ASCII panel
   -P, --no-position           hide the offset/position column
+      --minimal               compact rows: offset + hex + ascii, no separators
 
 OFFSET & NAVIGATION
   -s, --skip <N>              skip first N bytes (negative = from end)
@@ -218,7 +212,6 @@ MISC
 
 SIZE SUFFIXES: KiB/K/MiB/M/GiB/G/TiB/T/PiB/P/EiB/E  kB/MB/GB/TB/PB/EB  0x…
 ```
-
 
 ## Testing Conditions
 

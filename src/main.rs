@@ -1,33 +1,4 @@
-// `std::simd` is nightly-only (`portable_simd`, rust-lang/rust#86656), so the
-// gate is applied by `build.rs` only when the active toolchain accepts it.
 #![cfg_attr(simd_portable, feature(portable_simd))]
-//! Copyright 2026 CallMeAlphabet (ItzAlphabet)
-//!
-//! Licensed under the Apache License, Version 2.0 (the "License");
-//! you may not use this file except in compliance with the License.
-//! You may obtain a copy of the License at
-//!
-//!    http://www.apache.org/licenses/LICENSE-2.0
-//!
-//! Unless required by applicable law or agreed to in writing, software
-//! distributed under the License is distributed on an "AS IS" BASIS,
-//! WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-//! See the License for the specific language governing permissions and
-//! limitations under the License.
-
-//! fasthex – a very fast hex dumper
-//!
-//! Speed notes:
-//!   1. mmap + rayon parallel formatting in 64 MiB chunks.
-//!   2. AVX2: 32 bytes (2 rows) per SIMD call; SSE4.1/SSSE3 fallback (16 bytes).
-//!      Both paths only engage for canonical mode, width=16, group=1, no-border,
-//!      no-color, no-uppercase, offset-hex, big-endian — the common fast path.
-//!   3. Double-buffered I/O: a dedicated writer thread drains while rayon formats.
-//!   4. MADV_SEQUENTIAL + MADV_WILLNEED two chunks ahead.
-//!   5. vmsplice → splice zero-copy output path; falls back to write_all for ttys.
-//!   6. Streaming path uses a 4 MiB write buffer.
-//!   7. u64 offsets: 8 hex digits normally, grows naturally past 0xFFFFFFFF.
-//!   8. FASTHEX_DEFAULT_OPTS env var prepended before argv.
 
 #![allow(clippy::missing_safety_doc)]
 #![allow(clippy::too_many_arguments)]
@@ -48,7 +19,7 @@ use std::thread;
 const READ_BUF: usize = 4 * 1024 * 1024;
 const WRITE_BUF: usize = 4 * 1024 * 1024;
 const PIPE_SIZE_HINT: libc::c_int = 2 * 1024 * 1024;
-const _CHUNK_ROWS: usize = (64 * 1024 * 1024) / 76; // recalculated per-mode at runtime
+const _CHUNK_ROWS: usize = (64 * 1024 * 1024) / 76;
 
 static HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
 static HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
@@ -56,8 +27,6 @@ static HEX_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 #[cfg(simd_portable)]
 use std::simd::Simd;
 
-/// Portable nibble LUT hex encode of 16 bytes → 32 ASCII digits.
-/// LLVM lowers this to AVX2/SSSE3 on x86_64 and NEON `tbl` on aarch64.
 #[cfg(simd_portable)]
 #[inline(always)]
 fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
@@ -76,8 +45,6 @@ fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
     dst[..32].copy_from_slice(&out);
 }
 
-/// Scalar nibble LUT hex encode, used when the toolchain has no `std::simd`.
-/// Same output as the vector variant above, byte at a time.
 #[cfg(not(simd_portable))]
 #[inline(always)]
 fn encode_hex16_portable(src: &[u8], lut: &[u8; 16], dst: &mut [u8]) {
@@ -121,8 +88,33 @@ fn cpu_avx512() -> bool {
         false
     }
 }
+#[inline]
+fn cpu_avx512_vbmi() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        cpu_avx2() && cpu_avx512()
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512vbmi")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+#[inline]
+fn cpu_avx512_vbmi2() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        cpu_avx512_vbmi()
+            && is_x86_feature_detected!("avx512vbmi2")
+            && is_x86_feature_detected!("bmi2")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
 
-// CP437 table (256 entries, index = byte value)
 static CP437: [char; 256] = [
     ' ','☺','☻','♥','♦','♣','♠','•','◘','○','◙','♂','♀','♪','♫','☼',
     '►','◄','↕','‼','¶','§','▬','↨','↑','↓','→','←','∟','↔','▲','▼',
@@ -142,10 +134,116 @@ static CP437: [char; 256] = [
     '≡','±','≥','≤','⌠','⌡','÷','≈','°','∙','·','√','ⁿ','²','■',' ',
 ];
 
-// EBCDIC→ASCII table
+const fn cp437_utf8_table() -> ([[u8; 3]; 256], [u8; 256]) {
+    let mut bytes = [[0u8; 3]; 256];
+    let mut lens = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let cp = CP437[i] as u32;
+        if cp <= 0x7f {
+            bytes[i][0] = cp as u8;
+            lens[i] = 1;
+        } else if cp <= 0x7ff {
+            bytes[i][0] = (0xc0 | (cp >> 6)) as u8;
+            bytes[i][1] = (0x80 | (cp & 0x3f)) as u8;
+            lens[i] = 2;
+        } else {
+            bytes[i][0] = (0xe0 | (cp >> 12)) as u8;
+            bytes[i][1] = (0x80 | ((cp >> 6) & 0x3f)) as u8;
+            bytes[i][2] = (0x80 | (cp & 0x3f)) as u8;
+            lens[i] = 3;
+        }
+        i += 1;
+    }
+    (bytes, lens)
+}
+
+static CP437_UTF8_DATA: ([[u8; 3]; 256], [u8; 256]) = cp437_utf8_table();
+
+static DEC3: [[u8; 3]; 256] = {
+    let mut table = [[0u8; 3]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = [b'0' + (i / 100) as u8, b'0' + ((i / 10) % 10) as u8, b'0' + (i % 10) as u8];
+        i += 1;
+    }
+    table
+};
+
+static OCT3: [[u8; 3]; 256] = {
+    let mut table = [[0u8; 3]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i] = [b'0' + (i >> 6) as u8, b'0' + ((i >> 3) & 7) as u8, b'0' + (i & 7) as u8];
+        i += 1;
+    }
+    table
+};
+
+static BIN8: [[u8; 8]; 256] = {
+    let mut table = [[0u8; 8]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut j = 0usize;
+        while j < 8 {
+            table[i][j] = b'0' + ((i >> (7 - j)) & 1) as u8;
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+};
+
+static DEC5: [[u8; 5]; 65536] = {
+    let mut table = [[0u8; 5]; 65536];
+    let mut i = 0usize;
+    while i < 65536 {
+        table[i] = [
+            b'0' + (i / 10000) as u8,
+            b'0' + ((i / 1000) % 10) as u8,
+            b'0' + ((i / 100) % 10) as u8,
+            b'0' + ((i / 10) % 10) as u8,
+            b'0' + (i % 10) as u8,
+        ];
+        i += 1;
+    }
+    table
+};
+
+static OCT6: [[u8; 6]; 65536] = {
+    let mut table = [[0u8; 6]; 65536];
+    let mut i = 0usize;
+    while i < 65536 {
+        let mut j = 0usize;
+        while j < 6 {
+            table[i][j] = b'0' + ((i >> (15 - j * 3)) & 7) as u8;
+            j += 1;
+        }
+        i += 1;
+    }
+    table
+};
+
+static CHAR_FORMAT: [([u8; 4], u8); 256] = {
+    let mut table = [([0u8; 4], 4u8); 256];
+    let mut i = 0usize;
+    while i < 256 {
+        table[i].0 = [b' ', b'0' + (i >> 6) as u8, b'0' + ((i >> 3) & 7) as u8, b'0' + (i & 7) as u8];
+        if i >= 0x20 && i <= 0x7e {
+            table[i].0 = [b' ', b' ', b' ', i as u8];
+        }
+        if i == 0 || (i >= 7 && i <= 13) {
+            table[i].0 = [b' ', b' ', i as u8, 0];
+            table[i].1 = 3;
+        }
+        i += 1;
+    }
+    table
+};
+
 static EBCDIC_TO_ASCII: [u8; 256] = {
     let mut t = [b'.'; 256];
-    // printable EBCDIC ranges → ASCII
+
     let pairs: &[(u8,u8)] = &[
         (0x40,b' '),(0x4b,b'.'),(0x4c,b'<'),(0x4d,b'('),(0x4e,b'+'),(0x4f,b'|'),
         (0x50,b'&'),(0x5a,b'!'),(0x5b,b'$'),(0x5c,b'*'),(0x5d,b')'),(0x5e,b';'),
@@ -175,17 +273,17 @@ static EBCDIC_TO_ASCII: [u8; 256] = {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum DisplayMode {
     Canonical,
-    OneByteHex,        // -x
-    TwoByteHex,        // -X
-    OneByteOctal,      // -o
-    TwoByteOctal,      // -O
-    OneByteDecimal,    // -d
-    TwoByteDecimal,    // -D
-    OneByteChar,       // -c
-    Binary,            // -b
-    Plain,             // -p
-    CInclude,          // -i
-    Reverse,           // -r  (not a display mode per se, handled separately)
+    OneByteHex,
+    TwoByteHex,
+    OneByteOctal,
+    TwoByteOctal,
+    OneByteDecimal,
+    TwoByteDecimal,
+    OneByteChar,
+    Binary,
+    Plain,
+    CInclude,
+    Reverse,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -206,16 +304,16 @@ enum Endian { Big, Little }
 #[derive(Clone)]
 struct Options {
     mode:         DisplayMode,
-    width:        usize,        // bytes per row (0 = auto for unicode border)
-    group:        usize,        // bytes per group: 1,2,4,8
+    width:        usize,
+    group:        usize,
     endian:       Endian,
     border:       BorderStyle,
     no_ascii:     bool,
     minimal:      bool,
     no_position:  bool,
-    skip:         i64,          // signed: negative = from end
+    skip:         i64,
     length:       Option<u64>,
-    jump:         i64,          // signed offset bias
+    jump:         i64,
     uppercase:    bool,
     offset_dec:   bool,
     color:        ColorWhen,
@@ -224,12 +322,12 @@ struct Options {
     squeeze:      bool,
     max_lines:    Option<u64>,
     quiet:        bool,
-    // -F custom format strings
+
     formats:      Vec<String>,
-    files:        Vec<String>,  // "-" means stdin
-    // reverse-mode jump target
+    files:        Vec<String>,
+
     reverse_jump: Option<i64>,
-    // C include variable name (derived from first filename)
+
     include_name: Option<String>,
 }
 
@@ -670,7 +768,7 @@ fn parse_char_table(s: &str) -> Result<CharTable, String> {
 }
 
 fn parse_args() -> Result<Options, String> {
-    // Prepend FASTHEX_DEFAULT_OPTS
+
     let mut all_args: Vec<String> = Vec::new();
     if let Ok(defaults) = env::var("FASTHEX_DEFAULT_OPTS") {
         for tok in defaults.split_ascii_whitespace() {
@@ -713,7 +811,6 @@ fn parse_args() -> Result<Options, String> {
     Ok(opts)
 }
 
-// xxd behaviour: normally 8 hex digits, grows naturally past 0xFFFFFFFF
 #[inline(always)]
 fn offset_len(off: u64) -> usize {
     if off <= 0xFFFF_FFFF           { 8  }
@@ -731,10 +828,20 @@ fn offset_len(off: u64) -> usize {
 fn write_offset(dst: &mut [u8], off: u64, dec: bool, upper: bool) -> usize {
     let hex = if upper { HEX_UPPER } else { HEX_LOWER };
     if dec {
-        let s = format!("{:08}", off);
-        let b = s.as_bytes();
-        dst[..b.len()].copy_from_slice(b);
-        b.len()
+        let mut digits = [0u8; 20];
+        let mut n = digits.len();
+        let mut x = off;
+        loop {
+            n -= 1;
+            digits[n] = b'0' + (x % 10) as u8;
+            x /= 10;
+            if x == 0 { break; }
+        }
+        let used = digits.len() - n;
+        let len = used.max(8);
+        dst[..len - used].fill(b'0');
+        dst[len - used..len].copy_from_slice(&digits[n..]);
+        len
     } else {
         let len = offset_len(off);
         for k in 0..len {
@@ -753,10 +860,10 @@ fn _char_for_byte(b: u8, table: CharTable) -> &'static str {
         CharTable::Default => {
             if b == 0x00 { "⋄" }
             else if b == 0x20 { " " }
-            else if b >= 0x21 && b <= 0x7e { "?" } // placeholder; inline in hot path
+            else if b >= 0x21 && b <= 0x7e { "?" }
             else { "•" }
         }
-        _ => "." // placeholder; inline in hot paths
+        _ => "."
     }
 }
 
@@ -769,28 +876,54 @@ fn braille_for_byte(b: u8) -> [u8; 3] {
     ]
 }
 
-/// ANSI sequence for a byte value under the given scheme.
-fn byte_ansi(b: u8, scheme: ColorScheme) -> &'static str {
-    match scheme {
-        ColorScheme::Default => "\x1b[32m",
-        ColorScheme::Type => match b {
-            0x00        => "\x1b[90m",
-            0x01..=0x1f => "\x1b[33m",
-            0x20        => "\x1b[36m",
-            0x21..=0x7e => "\x1b[32m",
-            0x7f        => "\x1b[33m",
-            0x80..=0xff => "\x1b[31m",
-        },
-        ColorScheme::Gradient => {
-            match b {
-                0x00        => "\x1b[90m",
-                0x01..=0x3f => "\x1b[34m",
-                0x40..=0x7f => "\x1b[32m",
-                0x80..=0xbf => "\x1b[33m",
-                0xc0..=0xff => "\x1b[31m",
+const fn ansi_bytes(code: u8) -> [u8; 5] {
+    [0x1b, b'[', b'0' + code / 10, b'0' + code % 10, b'm']
+}
+
+const fn make_ansi_table(scheme: u8) -> [[u8; 5]; 256] {
+    let mut table = [[0u8; 5]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let code = if scheme == 0 {
+            32
+        } else if scheme == 1 {
+            match i {
+                0 => 90,
+                1..=31 => 33,
+                32 => 36,
+                33..=126 => 32,
+                127 => 33,
+                _ => 31,
             }
-        }
+        } else {
+            match i {
+                0 => 90,
+                1..=63 => 34,
+                64..=127 => 32,
+                128..=191 => 33,
+                _ => 31,
+            }
+        };
+        table[i] = ansi_bytes(code);
+        i += 1;
     }
+    table
+}
+
+static ANSI_BYTE_TABLES: [[[u8; 5]; 256]; 3] = [
+    make_ansi_table(0),
+    make_ansi_table(1),
+    make_ansi_table(2),
+];
+
+#[inline(always)]
+fn byte_ansi(b: u8, scheme: ColorScheme) -> &'static [u8; 5] {
+    let scheme = match scheme {
+        ColorScheme::Default => 0,
+        ColorScheme::Type => 1,
+        ColorScheme::Gradient => 2,
+    };
+    &ANSI_BYTE_TABLES[scheme][b as usize]
 }
 
 const ANSI_RESET:  &str = "\x1b[0m";
@@ -815,7 +948,7 @@ impl ZeroCopyWriter {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         let ok = unsafe { libc::fstat(libc::STDOUT_FILENO, &mut st) == 0 };
         let mode = if ok { st.st_mode & libc::S_IFMT } else { 0 };
-        if mode != libc::S_IFREG && mode != libc::S_IFIFO {
+        if mode != libc::S_IFREG {
             return Ok(Self { pipe_r: -1, pipe_w: -1, stdout: libc::STDOUT_FILENO, fallback: true });
         }
         let mut fds = [0i32; 2];
@@ -2035,6 +2168,10 @@ macro_rules! fast_pair_min_body {
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_min_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                                lut: &[u8; 16], has_ascii: bool, row_len: usize) { unsafe {
+    if cpu_avx512_vbmi() {
+        format_pairs_min_vbmi_run(dst, src, off, pairs, lut, has_ascii, row_len);
+        return;
+    }
     let lutp = lut.as_ptr();
     let mut i = 0;
     while i + 1 < pairs {
@@ -2185,6 +2322,153 @@ macro_rules! fast_pair_na {
 }
 
 #[cfg(target_arch = "x86_64")]
+const fn canon_vbmi_indices(row: usize) -> [u8; 64] {
+    let mut idx = [96u8; 64];
+    let mut j = 0usize;
+    while j < 16 {
+        let pos = 3 * j + if j >= 8 { 1 } else { 0 };
+        idx[pos] = (row * 32 + j * 2) as u8;
+        idx[pos + 1] = (row * 32 + j * 2 + 1) as u8;
+        j += 1;
+    }
+    idx[50] = 97;
+    let mut k = 0usize;
+    while k < 13 {
+        idx[51 + k] = (64 + row * 16 + k) as u8;
+        k += 1;
+    }
+    idx
+}
+
+#[cfg(target_arch = "x86_64")]
+static CANON_VBMI_IDX: [[u8; 64]; 2] = [canon_vbmi_indices(0), canon_vbmi_indices(1)];
+
+#[cfg(target_arch = "x86_64")]
+static CANON_VBMI_PANEL: [u8; 32] = {
+    let mut panel = [b' '; 32];
+    panel[1] = b'|';
+    panel
+};
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! vbmi_hex32 {
+    ($raw:expr, $lutp:expr) => {{
+        let words = _mm512_cvtepu8_epi16($raw);
+        let shifts = _mm512_set1_epi64(0x3034_2024_1014_0004u64 as i64);
+        let nibbles = _mm512_multishift_epi64_epi8(shifts, words);
+        let lutv = _mm512_broadcast_i32x4(_mm_loadu_si128($lutp as *const __m128i));
+        _mm512_permutexvar_epi8(nibbles, lutv)
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+macro_rules! fast_pair_vbmi_body {
+    ($dst:expr, $src:expr, $o0:expr, $o1:expr, $lutp:expr, $k:expr, $row_len:expr) => {{
+        let raw = _mm256_loadu_si256($src as *const __m256i);
+        let hex = vbmi_hex32!(raw, $lutp);
+        let d0 = $dst;
+        std::ptr::write_unaligned(d0 as *mut u64, $o0);
+        std::ptr::write_unaligned(d0.add(8) as *mut u16, 0x203a);
+        let d1 = d0.add($row_len);
+        std::ptr::write_unaligned(d1 as *mut u64, $o1);
+        std::ptr::write_unaligned(d1.add(8) as *mut u16, 0x203a);
+        if $k.has_ascii {
+            let pr = _mm256_and_si256(
+                _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
+            let asc = _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr);
+            let constants = _mm256_loadu_si256(CANON_VBMI_PANEL.as_ptr() as *const __m256i);
+            let panel = _mm512_inserti64x4(_mm512_castsi256_si512(asc), constants, 1);
+            let idx0 = _mm512_loadu_si512(CANON_VBMI_IDX[0].as_ptr() as *const _);
+            let idx1 = _mm512_loadu_si512(CANON_VBMI_IDX[1].as_ptr() as *const _);
+            let p0 = d0.add(10);
+            let p1 = d1.add(10);
+            let v0 = _mm512_permutex2var_epi8(hex, idx0, panel);
+            let v1 = _mm512_permutex2var_epi8(hex, idx1, panel);
+            _mm512_storeu_si512(p0 as *mut _, v0);
+            _mm512_storeu_si512(p1 as *mut _, v1);
+            let a0 = _mm256_castsi256_si128(asc);
+            let a1 = _mm256_extracti128_si256(asc, 1);
+            let t0 = (_mm_cvtsi128_si32(_mm_srli_si128(a0, 13)) as u32 & 0x00ff_ffff) | 0x7c00_0000;
+            let t1 = (_mm_cvtsi128_si32(_mm_srli_si128(a1, 13)) as u32 & 0x00ff_ffff) | 0x7c00_0000;
+            std::ptr::write_unaligned(p0.add(64) as *mut u32, t0);
+            std::ptr::write_unaligned(p1.add(64) as *mut u32, t1);
+            *p0.add(68) = $k.nl;
+            *p1.add(68) = $k.nl;
+        } else {
+            let panel = _mm512_set1_epi8(b' ' as i8);
+            let idx0 = _mm512_loadu_si512(CANON_VBMI_IDX[0].as_ptr() as *const _);
+            let idx1 = _mm512_loadu_si512(CANON_VBMI_IDX[1].as_ptr() as *const _);
+            let v0 = _mm512_permutex2var_epi8(hex, idx0, panel);
+            let v1 = _mm512_permutex2var_epi8(hex, idx1, panel);
+            _mm512_mask_storeu_epi8(d0.add(10) as *mut i8, (1u64 << 49) - 1, v0);
+            _mm512_mask_storeu_epi8(d1.add(10) as *mut i8, (1u64 << 49) - 1, v1);
+            *d0.add(58) = b'\n';
+            *d1.add(58) = b'\n';
+        }
+    }};
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,ssse3,sse4.1,avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn format_pairs_vbmi_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                                lut: &[u8; 16], k: CanonKernel, row_len: usize) { unsafe {
+    let lutp = lut.as_ptr();
+    let mut i = 0usize;
+    while i + 1 < pairs {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+        fast_pair_vbmi_body!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
+        fast_pair_vbmi_body!(dst.add((i + 1) * row_len * 2), src.add((i + 1) * 32), o8[2], o8[3], lutp, &k, row_len);
+        i += 2;
+    }
+    if i < pairs {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+        fast_pair_vbmi_body!(dst.add(i * row_len * 2), src.add(i * 32), o8[0], o8[1], lutp, &k, row_len);
+    }
+}}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,ssse3,sse4.1,avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn format_pairs_min_vbmi_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
+                                    lut: &[u8; 16], has_ascii: bool, row_len: usize) { unsafe {
+    let lutp = lut.as_ptr();
+    for i in 0..pairs {
+        let o8 = hex_offsets4!(off.wrapping_add((i * 32) as u64), lutp);
+        let raw = _mm256_loadu_si256(src.add(i * 32) as *const __m256i);
+        let hex = vbmi_hex32!(raw, lutp);
+        let asc = if has_ascii {
+            let pr = _mm256_and_si256(
+                _mm256_cmpgt_epi8(raw, _mm256_set1_epi8(0x1f)),
+                _mm256_cmpgt_epi8(_mm256_set1_epi8(0x7f), raw));
+            _mm256_blendv_epi8(_mm256_set1_epi8(b'.' as i8), raw, pr)
+        } else {
+            _mm256_setzero_si256()
+        };
+        let d0 = dst.add(i * row_len * 2);
+        let d1 = d0.add(row_len);
+        std::ptr::write_unaligned(d0 as *mut u64, o8[0]);
+        std::ptr::write_unaligned(d1 as *mut u64, o8[1]);
+        *d0.add(8) = b' ';
+        *d1.add(8) = b' ';
+        let p0 = d0.add(9);
+        let p1 = d1.add(9);
+        _mm256_storeu_si256(p0 as *mut __m256i, _mm512_castsi512_si256(hex));
+        _mm256_storeu_si256(p1 as *mut __m256i, _mm512_extracti64x4_epi64(hex, 1));
+        if has_ascii {
+            *p0.add(32) = b' ';
+            *p1.add(32) = b' ';
+            _mm_storeu_si128(p0.add(33) as *mut __m128i, _mm256_castsi256_si128(asc));
+            _mm_storeu_si128(p1.add(33) as *mut __m128i, _mm256_extracti128_si256(asc, 1));
+            *p0.add(49) = b'\n';
+            *p1.add(49) = b'\n';
+        } else {
+            *p0.add(32) = b'\n';
+            *p1.add(32) = b'\n';
+        }
+    }
+}}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
                            k: CanonKernel, lut: &[u8; 16], row_len: usize) -> usize { unsafe {
@@ -2201,6 +2485,10 @@ unsafe fn format_pair_fast(dst: *mut u8, src: *const u8, o8: [u64; 2],
 #[target_feature(enable = "avx2,ssse3,sse4.1")]
 unsafe fn format_pairs_fast_run(dst: *mut u8, src: *const u8, off: u64, pairs: usize,
                                 lut: &[u8; 16], k: CanonKernel, row_len: usize) { unsafe {
+    if cpu_avx512_vbmi() {
+        format_pairs_vbmi_run(dst, src, off, pairs, lut, k, row_len);
+        return;
+    }
     let lutp = lut.as_ptr();
     let mut i = 0;
     if k.has_ascii {
@@ -2268,7 +2556,7 @@ unsafe fn format_row(dst: *mut u8, src: *const u8, off: u64, n: usize,
     let slice = std::slice::from_raw_parts(src, n);
     format_row_generic(&mut v, slice, off, &core.opts);
     let plen = write_prefix(dst, off, core);
-    // generic includes prefix; just copy whole row
+
     let _ = plen;
     std::ptr::copy_nonoverlapping(v.as_ptr(), dst, v.len());
     let _ = layout;
@@ -2342,10 +2630,11 @@ fn _write_hex_group(dst: &mut Vec<u8>, src: &[u8], group: usize, endian: Endian,
         Box::new(src[..len].iter().copied())
     };
     for b in iter { dst.push(hex[(b>>4) as usize]); dst.push(hex[(b&0xf) as usize]); }
-    // pad if partial
+
     for _ in len..group { dst.push(b' '); dst.push(b' '); }
 }
 
+#[inline(always)]
 fn ascii_byte(b: u8, table: CharTable, buf: &mut Vec<u8>) {
     match table {
         CharTable::Ascii => {
@@ -2364,13 +2653,34 @@ fn ascii_byte(b: u8, table: CharTable, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&encoded);
         }
         CharTable::Cp437 => {
-            let c = CP437[b as usize];
-            let mut tmp = [0u8; 4];
-            buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+            let i = b as usize;
+            buf.extend_from_slice(&CP437_UTF8_DATA.0[i][..CP437_UTF8_DATA.1[i] as usize]);
         }
         CharTable::Ebcdic => {
             let c = EBCDIC_TO_ASCII[b as usize];
             buf.push(if c >= 0x20 && c <= 0x7e { c } else { b'.' });
+        }
+    }
+}
+
+#[inline(always)]
+fn write_ascii_byte(out: &mut impl Write, b: u8, table: CharTable) -> io::Result<()> {
+    match table {
+        CharTable::Ascii => out.write_all(&[if (0x20..=0x7e).contains(&b) { b } else { b'.' }]),
+        CharTable::Default => match b {
+            0x00 => out.write_all("⋄".as_bytes()),
+            0x20 => out.write_all(b" "),
+            0x21..=0x7e => out.write_all(&[b]),
+            _ => out.write_all("•".as_bytes()),
+        },
+        CharTable::Braille => out.write_all(&braille_for_byte(b)),
+        CharTable::Cp437 => {
+            let i = b as usize;
+            out.write_all(&CP437_UTF8_DATA.0[i][..CP437_UTF8_DATA.1[i] as usize])
+        }
+        CharTable::Ebcdic => {
+            let c = EBCDIC_TO_ASCII[b as usize];
+            out.write_all(&[if (0x20..=0x7e).contains(&c) { c } else { b'.' }])
         }
     }
 }
@@ -2387,8 +2697,8 @@ fn hex_width(opts: &Options) -> usize {
                     if i % (bpr / 2) == 0 { w += 1; }
                     else if group > 1 && i % group == 0 { w += 1; }
                 }
-                w += 2; // hex digits
-                if i < bpr - 1 { w += 1; } // space between bytes
+                w += 2;
+                if i < bpr - 1 { w += 1; }
             }
             w
         }
@@ -2417,6 +2727,72 @@ fn ascii_width(opts: &Options) -> usize {
     opts.width
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi2,bmi2")]
+unsafe fn char_body_vbmi2(dst: *mut u8, src: *const u8) -> usize { unsafe {
+    let values = _mm512_cvtepu8_epi32(_mm_loadu_si128(src as *const __m128i));
+    let printable = _mm512_cmpgt_epi32_mask(values, _mm512_set1_epi32(0x1f))
+        & _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(0x7f), values);
+    let special = _mm512_cmpeq_epi32_mask(values, _mm512_setzero_si512())
+        | (_mm512_cmpgt_epi32_mask(values, _mm512_set1_epi32(6))
+            & _mm512_cmpgt_epi32_mask(_mm512_set1_epi32(14), values));
+    let seven = _mm512_set1_epi32(7);
+    let ascii = _mm512_set1_epi32(0x30);
+    let d0 = _mm512_or_si512(_mm512_srli_epi32(values, 6), ascii);
+    let d1 = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi32(values, 3), seven), ascii);
+    let d2 = _mm512_or_si512(_mm512_and_si512(values, seven), ascii);
+    let octal = _mm512_or_si512(
+        _mm512_set1_epi32(0x20),
+        _mm512_or_si512(
+            _mm512_slli_epi32(d0, 8),
+            _mm512_or_si512(_mm512_slli_epi32(d1, 16), _mm512_slli_epi32(d2, 24)),
+        ),
+    );
+    let printable_cell = _mm512_or_si512(_mm512_set1_epi32(0x0020_2020), _mm512_slli_epi32(values, 24));
+    let special_cell = _mm512_or_si512(_mm512_set1_epi32(0x0000_2020), _mm512_slli_epi32(values, 16));
+    let cells = _mm512_mask_blend_epi32(printable, octal, printable_cell);
+    let cells = _mm512_mask_blend_epi32(special, cells, special_cell);
+    let omitted = _pdep_u64(special as u64, 0x8888_8888_8888_8888);
+    _mm512_mask_compressstoreu_epi8(dst as *mut i8, !omitted, cells);
+    64 - (special as u16).count_ones() as usize
+}}
+
+#[cfg(target_arch = "x86_64")]
+const fn binary_indices(which: usize) -> [u8; 64] {
+    let mut indices = [0u8; 64];
+    let mut i = 0usize;
+    while i < 64 {
+        indices[i] = if which == 0 {
+            if i % 9 == 0 { 0 } else { (i - i / 9 - 1) as u8 }
+        } else if i < 8 {
+            56 + i as u8
+        } else {
+            0
+        };
+        i += 1;
+    }
+    indices
+}
+
+#[cfg(target_arch = "x86_64")]
+static BINARY_INDICES: [[u8; 64]; 2] = [binary_indices(0), binary_indices(1)];
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn binary_body_vbmi(dst: *mut u8, src: *const u8) { unsafe {
+    let values = _mm512_cvtepu8_epi64(_mm_loadl_epi64(src as *const __m128i));
+    let controls = _mm512_set1_epi64(0x0001_0203_0405_0607);
+    let bits = _mm512_multishift_epi64_epi8(controls, values);
+    let digits = _mm512_or_si512(_mm512_and_si512(bits, _mm512_set1_epi8(1)), _mm512_set1_epi8(0x30));
+    let index0 = _mm512_loadu_si512(BINARY_INDICES[0].as_ptr() as *const _);
+    let index1 = _mm512_loadu_si512(BINARY_INDICES[1].as_ptr() as *const _);
+    let first = _mm512_permutexvar_epi8(index0, digits);
+    let first = _mm512_mask_mov_epi8(first, 0x8040_2010_0804_0201, _mm512_set1_epi8(b' ' as i8));
+    _mm512_storeu_si512(dst as *mut _, first);
+    let last = _mm512_permutexvar_epi8(index1, digits);
+    _mm512_mask_storeu_epi8(dst.add(64) as *mut i8, 0xff, last);
+}}
+
 fn format_row_generic(
     dst:         &mut Vec<u8>,
     src:         &[u8],
@@ -2427,6 +2803,99 @@ fn format_row_generic(
     let width  = opts.width;
     let group  = opts.group;
     let n      = src.len();
+
+    let simple_two_byte = matches!(opts.mode, DisplayMode::TwoByteOctal | DisplayMode::TwoByteDecimal)
+        && group == 2 && opts.endian == Endian::Big;
+    let simple_one_byte = matches!(opts.mode,
+        DisplayMode::OneByteDecimal | DisplayMode::OneByteChar | DisplayMode::Binary);
+    if src.len() == 16 && width == 16 && !opts.no_position && opts.border == BorderStyle::None
+        && (simple_two_byte || simple_one_byte)
+    {
+        let mut tmp = [0u8; 20];
+        let olen = write_offset(&mut tmp, display_off, opts.offset_dec, opts.uppercase);
+        let body_len = match opts.mode {
+            DisplayMode::TwoByteOctal => 56,
+            DisplayMode::TwoByteDecimal => 48,
+            DisplayMode::OneByteDecimal => 64,
+            DisplayMode::OneByteChar => src.iter().map(|&b| CHAR_FORMAT[b as usize].1 as usize).sum(),
+            DisplayMode::Binary => 72,
+            _ => unreachable!(),
+        };
+        let needed = olen + body_len + 3;
+        dst.reserve(needed);
+        unsafe {
+            let base = dst.as_mut_ptr().add(dst.len());
+            let mut p = base;
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+            p = p.add(olen);
+            *p = b':';
+            *p.add(1) = b' ';
+            p = p.add(2);
+            match opts.mode {
+                DisplayMode::TwoByteOctal => {
+                    for i in 0..8 {
+                        let v = u16::from_be_bytes([src[i * 2], src[i * 2 + 1]]);
+                        *p = b' ';
+                        std::ptr::copy_nonoverlapping(OCT6[v as usize].as_ptr(), p.add(1), 6);
+                        p = p.add(7);
+                    }
+                }
+                DisplayMode::TwoByteDecimal => {
+                    for i in 0..8 {
+                        let v = u16::from_be_bytes([src[i * 2], src[i * 2 + 1]]);
+                        *p = b' ';
+                        std::ptr::copy_nonoverlapping(DEC5[v as usize].as_ptr(), p.add(1), 5);
+                        p = p.add(6);
+                    }
+                }
+                DisplayMode::OneByteDecimal => {
+                    for &b in src {
+                        *p = b' ';
+                        std::ptr::copy_nonoverlapping(DEC3[b as usize].as_ptr(), p.add(1), 3);
+                        p = p.add(4);
+                    }
+                }
+                DisplayMode::OneByteChar => {
+                    let mut vectorized = false;
+                    #[cfg(target_arch = "x86_64")]
+                    if cpu_avx512_vbmi2() {
+                        p = p.add(char_body_vbmi2(p, src.as_ptr()));
+                        vectorized = true;
+                    }
+                    if !vectorized {
+                        for &b in src {
+                            let (encoded, len) = &CHAR_FORMAT[b as usize];
+                            let len = *len as usize;
+                            std::ptr::copy_nonoverlapping(encoded.as_ptr(), p, len);
+                            p = p.add(len);
+                        }
+                    }
+                }
+                DisplayMode::Binary => {
+                    let mut vectorized = false;
+                    #[cfg(target_arch = "x86_64")]
+                    if cpu_avx512_vbmi() {
+                        binary_body_vbmi(p, src.as_ptr());
+                        p = p.add(72);
+                        vectorized = true;
+                    }
+                    if !vectorized {
+                        for &b in &src[..8] {
+                            *p = b' ';
+                            std::ptr::copy_nonoverlapping(BIN8[b as usize].as_ptr(), p.add(1), 8);
+                            p = p.add(9);
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            *p = b'\n';
+            p = p.add(1);
+            debug_assert_eq!(p.offset_from(base) as usize, needed);
+            dst.set_len(dst.len() + needed);
+        }
+        return;
+    }
 
     if opts.minimal && opts.mode == DisplayMode::Canonical {
         if !opts.no_position {
@@ -2455,7 +2924,6 @@ fn format_row_generic(
     let mid_bar   = left_bar;
     let right_bar = left_bar;
 
-    // Offset column
     if !opts.no_position {
         if opts.border != BorderStyle::None { dst.extend_from_slice(left_bar.as_bytes()); }
         let mut tmp = [0u8; 20];
@@ -2471,7 +2939,6 @@ fn format_row_generic(
         }
     }
 
-    // Hex section
     if opts.border != BorderStyle::None {
         if opts.no_position { dst.extend_from_slice(left_bar.as_bytes()); }
         else                { dst.extend_from_slice(mid_bar.as_bytes()); }
@@ -2496,7 +2963,7 @@ fn format_row_generic(
                     dst.push(hex[(b & 0xf) as usize]);
                     if i < width - 1 || (!opts.no_ascii && opts.border == BorderStyle::None) { dst.push(b' '); }
                 } else {
-                    dst.push(b' '); dst.push(b' '); 
+                    dst.push(b' '); dst.push(b' ');
                     if i < width - 1 || (!opts.no_ascii && opts.border == BorderStyle::None) { dst.push(b' '); }
                 }
             }
@@ -2516,7 +2983,7 @@ fn format_row_generic(
                 let bi = i * g;
                 if bi < n {
                     let v = read_le_u64(&src[bi..], g.min(n-bi), opts.endian);
-                    // pad to g*2 hex digits
+
                     dst.push(b' ');
                     for k in (0..g*2).rev() {
                         dst.push(hex[((v >> (k*4)) & 0xf) as usize]);
@@ -2529,7 +2996,7 @@ fn format_row_generic(
         DisplayMode::OneByteOctal => {
             for i in 0..width {
                 dst.push(b' ');
-                if i < n { let b=src[i]; dst.push(b'0'+(b>>6)); dst.push(b'0'+((b>>3)&7)); dst.push(b'0'+(b&7)); }
+                if i < n { dst.extend_from_slice(&OCT3[src[i] as usize]); }
                 else { dst.extend_from_slice(b"   "); }
             }
         }
@@ -2540,10 +3007,13 @@ fn format_row_generic(
                 dst.push(b' ');
                 if bi < n {
                     let v = read_le_u64(&src[bi..], g.min(n-bi), opts.endian);
-                    // 6 octal digits for u16
-                    let digits = g * 3;
-                    for k in (0..digits).rev() {
-                        dst.push(b'0' + ((v >> (k*3)) & 7) as u8);
+                    if g == 2 {
+                        dst.extend_from_slice(&OCT6[v as usize]);
+                    } else {
+                        let digits = g * 3;
+                        for k in (0..digits).rev() {
+                            dst.push(b'0' + ((v >> (k*3)) & 7) as u8);
+                        }
                     }
                 } else {
                     for _ in 0..g*3 { dst.push(b' '); }
@@ -2554,10 +3024,7 @@ fn format_row_generic(
             for i in 0..width {
                 dst.push(b' ');
                 if i < n {
-                    let b = src[i];
-                    dst.push(b'0' + b/100);
-                    dst.push(b'0' + (b/10)%10);
-                    dst.push(b'0' + b%10);
+                    dst.extend_from_slice(&DEC3[src[i] as usize]);
                 } else { dst.extend_from_slice(b"   "); }
             }
         }
@@ -2568,28 +3035,15 @@ fn format_row_generic(
                 if bi < n {
                     let v = read_le_u64(&src[bi..], g.min(n-bi), opts.endian);
                     dst.push(b' ');
-                    // max 5 decimal digits for u16
-                    let s = format!("{:05}", v as u16);
-                    dst.extend_from_slice(s.as_bytes());
+                    dst.extend_from_slice(&DEC5[v as u16 as usize]);
                 } else { dst.extend_from_slice(b"      "); }
             }
         }
         DisplayMode::OneByteChar => {
             for i in 0..width {
                 if i < n {
-                    let b = src[i];
-                    match b {
-                        0x00 => dst.extend_from_slice(b"  \0"),
-                        0x07 => dst.extend_from_slice(b"  \x07"),
-                        0x08 => dst.extend_from_slice(b"  \x08"),
-                        0x09 => dst.extend_from_slice(b"  \t"),
-                        0x0a => dst.extend_from_slice(b"  \n"),
-                        0x0b => dst.extend_from_slice(b"  \x0b"),
-                        0x0c => dst.extend_from_slice(b"  \x0c"),
-                        0x0d => dst.extend_from_slice(b"  \r"),
-                        0x20..=0x7e => { dst.push(b' '); dst.push(b' '); dst.push(b' '); dst.push(b); }
-                        _ => { dst.push(b' '); dst.push(b'0'+(b>>6)); dst.push(b'0'+((b>>3)&7)); dst.push(b'0'+(b&7)); }
-                    }
+                    let (encoded, len) = &CHAR_FORMAT[src[i] as usize];
+                    dst.extend_from_slice(&encoded[..*len as usize]);
                 } else { dst.extend_from_slice(b"    "); }
             }
         }
@@ -2597,22 +3051,19 @@ fn format_row_generic(
             for i in 0..8usize {
                 dst.push(b' ');
                 if i < n {
-                    let b = src[i];
-                    for bit in (0..8).rev() { dst.push(b'0' + ((b >> bit) & 1)); }
+                    dst.extend_from_slice(&BIN8[src[i] as usize]);
                 } else { dst.extend_from_slice(b"        "); }
             }
         }
-        _ => {} // Plain/CInclude/Reverse don't use this path
+        _ => {}
     }
 
-    // Pad Hex section to match border
     if opts.border != BorderStyle::None {
         let hex_len = dst.len() - hex_start;
         let pad = hex_width(opts).saturating_sub(hex_len);
         for _ in 0..pad { dst.push(b' '); }
     }
 
-    // ASCII panel
     if !opts.no_ascii && !matches!(opts.mode,
         DisplayMode::Binary | DisplayMode::OneByteOctal | DisplayMode::TwoByteOctal |
         DisplayMode::OneByteDecimal | DisplayMode::TwoByteDecimal |
@@ -2672,15 +3123,39 @@ unsafe fn plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool)
     }
 }}
 
-fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
-    let blocks = data.len() / 16;
-    let tail_len = data.len() % 16;
-    let chunk_blocks = ((16 * 1024 * 1024) / 32).max(1);
-    let buf_cap = chunk_blocks * 32 + 16;
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,ssse3,sse4.1,avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn plain_blocks_vbmi(dst: *mut u8, src: *const u8, blocks: usize, upper: bool) { unsafe {
+    let lutp = if upper { HEX_UPPER.as_ptr() } else { HEX_LOWER.as_ptr() };
+    let mut i = 0usize;
+    while i < blocks {
+        let raw = _mm256_loadu_si256(src.add(i * 32) as *const __m256i);
+        let hex = vbmi_hex32!(raw, lutp);
+        _mm512_storeu_si512(dst.add(i * 64) as *mut _, hex);
+        i += 1;
+    }
+}}
 
-    let (send_data, recv_data) = sync_channel::<Vec<u8>>(5);
+#[inline(always)]
+unsafe fn encode_plain_blocks(dst: *mut u8, src: *const u8, blocks: usize, upper: bool, _vbmi: bool) { unsafe {
+    #[cfg(target_arch = "x86_64")]
+    if _vbmi {
+        plain_blocks_vbmi(dst, src, blocks, upper);
+        return;
+    }
+    plain_blocks(dst, src, blocks * 2, upper);
+}}
+
+fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
+    let blocks = data.len() / 32;
+    let tail_len = data.len() % 32;
+    let chunk_blocks = ((8 * 1024 * 1024) / 64).max(1).min(blocks.max(1));
+    let task_blocks = 1024usize;
+    let buf_cap = chunk_blocks * 64 + 16;
+
+    let (send_data, recv_data) = sync_channel::<Vec<u8>>(1);
     let (send_free, recv_free) = channel::<Vec<u8>>();
-    for _ in 0..6 {
+    for _ in 0..2 {
         let buf = vec![0u8; buf_cap];
         send_free.send(buf).unwrap();
     }
@@ -2698,22 +3173,24 @@ fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
     });
 
     let upper = opts.uppercase;
+    let vbmi = cpu_avx512_vbmi();
     let mut cursor = 0usize;
     while cursor < blocks {
         let n = (blocks - cursor).min(chunk_blocks);
+        let payload = n * 64;
         let mut chunk_out = recv_free.recv().unwrap();
-        chunk_out.resize(n * 32 + 16, 0);
-        {
-            chunk_out[..n * 32]
-                .par_chunks_mut(32)
-                .enumerate()
-                .for_each(|(i, row)| {
-                    unsafe {
-                        plain_blocks(row.as_mut_ptr(), data.as_ptr().add((cursor + i) * 16), 1, upper);
-                    }
-                });
-        }
-        chunk_out.truncate(n * 32);
+        chunk_out.resize(payload + 16, 0);
+        chunk_out[..payload]
+            .par_chunks_mut(task_blocks * 64)
+            .enumerate()
+            .for_each(|(i, out)| {
+                let first = cursor + i * task_blocks;
+                let count = out.len() / 64;
+                unsafe {
+                    encode_plain_blocks(out.as_mut_ptr(), data.as_ptr().add(first * 32), count, upper, vbmi);
+                }
+            });
+        chunk_out.truncate(payload);
         send_data.send(chunk_out).unwrap();
         cursor += n;
     }
@@ -2723,7 +3200,7 @@ fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
     let mut so = io::stdout().lock();
     if tail_len > 0 {
         let hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
-        for &b in &data[blocks * 16..] {
+        for &b in &data[blocks * 32..] {
             so.write_all(&[hex[(b >> 4) as usize], hex[(b & 0xf) as usize]])?;
         }
     }
@@ -2732,10 +3209,12 @@ fn run_plain_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
 }
 
 fn run_plain(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
-    let _hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+    let hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(WRITE_BUF, stdout.lock());
     let mut buf = vec![0u8; READ_BUF];
+    let mut encoded = vec![0u8; READ_BUF * 2 + 64];
+    let vbmi = cpu_avx512_vbmi();
     let mut total = 0u64;
     loop {
         let max = match opts.length {
@@ -2746,11 +3225,90 @@ fn run_plain(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
         let n = reader.read(&mut buf[..max])?;
         if n == 0 { break; }
         total += n as u64;
-        for &b in &buf[..n] { out.write_all(&[_hex[(b>>4) as usize], _hex[(b&0xf) as usize]])?; }
+        let blocks = n / 32;
+        unsafe {
+            encode_plain_blocks(encoded.as_mut_ptr(), buf.as_ptr(), blocks, opts.uppercase, vbmi);
+        }
+        let mut pos = blocks * 64;
+        for &b in &buf[blocks * 32..n] {
+            encoded[pos] = hex[(b >> 4) as usize];
+            encoded[pos + 1] = hex[(b & 0xf) as usize];
+            pos += 2;
+        }
+        out.write_all(&encoded[..n * 2])?;
     }
     out.write_all(b"\n")?;
     out.flush()
 }
+
+#[cfg(target_arch = "x86_64")]
+const fn cinclude_vbmi_indices(part: usize) -> [u8; 64] {
+    let mut idx = [67u8; 64];
+    let mut j = 0usize;
+    while j < 12 {
+        let base = 2 + j * 6;
+        let mut c = 0usize;
+        while c < 6 {
+            let pos = base + c;
+            if pos >= part * 64 && pos < part * 64 + 64 {
+                idx[pos - part * 64] = match c {
+                    0 => 64,
+                    1 => 65,
+                    2 => (j * 2) as u8,
+                    3 => (j * 2 + 1) as u8,
+                    4 => 66,
+                    _ => 67,
+                };
+            }
+            c += 1;
+        }
+        j += 1;
+    }
+    if 74 >= part * 64 && 74 < part * 64 + 64 {
+        idx[74 - part * 64] = 68;
+    }
+    idx
+}
+
+#[cfg(target_arch = "x86_64")]
+static CINCLUDE_VBMI_IDX: [[u8; 64]; 2] = [cinclude_vbmi_indices(0), cinclude_vbmi_indices(1)];
+
+#[cfg(target_arch = "x86_64")]
+static CINCLUDE_VBMI_CONST: [u8; 64] = {
+    let mut values = [0u8; 64];
+    values[0] = b'0';
+    values[1] = b'x';
+    values[2] = b',';
+    values[3] = b' ';
+    values[4] = b'\n';
+    values
+};
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,ssse3,sse4.1,avx512f,avx512bw,avx512vl,avx512vbmi")]
+unsafe fn include_lines_vbmi(dst: *mut u8, src: *const u8, lines: usize, upper: bool) { unsafe {
+    let lutp = if upper { HEX_UPPER.as_ptr() } else { HEX_LOWER.as_ptr() };
+    let constants = _mm512_loadu_si512(CINCLUDE_VBMI_CONST.as_ptr() as *const _);
+    let idx0 = _mm512_loadu_si512(CINCLUDE_VBMI_IDX[0].as_ptr() as *const _);
+    let idx1 = _mm512_loadu_si512(CINCLUDE_VBMI_IDX[1].as_ptr() as *const _);
+    for i in 0..lines {
+        let raw = _mm256_maskz_loadu_epi8(0x0fff, src.add(i * 12) as *const i8);
+        let hex = vbmi_hex32!(raw, lutp);
+        let v0 = _mm512_permutex2var_epi8(hex, idx0, constants);
+        let v1 = _mm512_permutex2var_epi8(hex, idx1, constants);
+        _mm512_storeu_si512(dst.add(i * 75) as *mut _, v0);
+        _mm512_mask_storeu_epi8(dst.add(i * 75 + 64) as *mut i8, 0x07ff, v1);
+    }
+}}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn include_lines_vbmi(dst: *mut u8, src: *const u8, lines: usize, upper: bool) { unsafe {
+    for i in 0..lines {
+        let line = std::slice::from_raw_parts(src.add(i * 12), 12);
+        include_line(dst.add(i * 75), line, upper);
+        *dst.add(i * 75 + 74) = b'\n';
+    }
+}}
 
 fn include_line(dst: *mut u8, src: &[u8], upper: bool) {
     let hex = if upper { HEX_UPPER } else { HEX_LOWER };
@@ -2776,7 +3334,8 @@ fn run_c_include_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
     let lines = data.len() / 12;
     let tail_len = data.len() % 12;
     let line_len = 75usize;
-    let chunk_lines = ((16 * 1024 * 1024) / line_len).max(1);
+    let task_lines = 1024usize;
+    let chunk_lines = ((8 * 1024 * 1024) / line_len).max(1).min(lines.max(1));
     let buf_cap = chunk_lines * line_len + 16;
 
     {
@@ -2785,9 +3344,9 @@ fn run_c_include_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
         so.flush()?;
     }
 
-    let (send_data, recv_data) = sync_channel::<Vec<u8>>(5);
+    let (send_data, recv_data) = sync_channel::<Vec<u8>>(1);
     let (send_free, recv_free) = channel::<Vec<u8>>();
-    for _ in 0..6 {
+    for _ in 0..2 {
         let buf = vec![0u8; buf_cap];
         send_free.send(buf).unwrap();
     }
@@ -2805,6 +3364,7 @@ fn run_c_include_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
     });
 
     let upper = opts.uppercase;
+    let vbmi = cpu_avx512_vbmi();
     let mut cursor = 0usize;
     while cursor < lines {
         let n = (lines - cursor).min(chunk_lines);
@@ -2812,12 +3372,22 @@ fn run_c_include_mmap(opts: &Options, data: &[u8]) -> io::Result<()> {
         chunk_out.resize(n * line_len + 16, 0);
         {
             chunk_out[..n * line_len]
-                .par_chunks_mut(line_len)
+                .par_chunks_mut(task_lines * line_len)
                 .enumerate()
-                .for_each(|(i, row)| {
-                    let src = &data[(cursor + i) * 12..(cursor + i) * 12 + 12];
-                    include_line(row.as_mut_ptr(), src, upper);
-                    unsafe { *row.as_mut_ptr().add(74) = b'\n'; }
+                .for_each(|(i, block)| {
+                    let first = cursor + i * task_lines;
+                    let count = block.len() / line_len;
+                    if vbmi {
+                        unsafe {
+                            include_lines_vbmi(block.as_mut_ptr(), data.as_ptr().add(first * 12), count, upper);
+                        }
+                    } else {
+                        for (j, row) in block.chunks_exact_mut(line_len).enumerate() {
+                            let src = &data[(first + j) * 12..(first + j) * 12 + 12];
+                            include_line(row.as_mut_ptr(), src, upper);
+                            unsafe { *row.as_mut_ptr().add(74) = b'\n'; }
+                        }
+                    }
                 });
         }
         chunk_out.truncate(n * line_len);
@@ -2874,6 +3444,84 @@ fn run_c_include(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
     out.flush()
 }
 
+static HEX_VALUES: [u8; 256] = {
+    let mut table = [0xffu8; 256];
+    let mut i = 0usize;
+    while i < 10 { table[b'0' as usize + i] = i as u8; i += 1; }
+    i = 0;
+    while i < 6 {
+        table[b'a' as usize + i] = 10 + i as u8;
+        table[b'A' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    table
+};
+
+fn parse_reverse_hex(s: &[u8]) -> Option<u64> {
+    if s.is_empty() { return None; }
+    let mut value = 0u64;
+    for &b in s {
+        let digit = HEX_VALUES[b as usize];
+        if digit == 0xff { return None; }
+        value = value.checked_mul(16)?.checked_add(digit as u64)?;
+    }
+    Some(value)
+}
+
+fn reverse_plain_hex_len(content: &[u8]) -> Option<usize> {
+    let mut total = 0usize;
+    for line in content.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        if line.len() & 1 != 0 || !line.iter().all(|b| HEX_VALUES[*b as usize] != 0xff) {
+            return None;
+        }
+        total += line.len() / 2;
+    }
+    Some(total)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn reverse_hex64(dst: *mut u8, src: *const u8, blocks: usize) { unsafe {
+    for i in 0..blocks {
+        let raw = _mm512_loadu_si512(src.add(i * 64) as *const _);
+        let alpha = _mm512_test_epi8_mask(raw, _mm512_set1_epi8(0x40));
+        let nibbles = _mm512_and_si512(raw, _mm512_set1_epi8(0x0f));
+        let nibbles = _mm512_mask_add_epi8(nibbles, alpha, nibbles, _mm512_set1_epi8(9));
+        let pairs = _mm512_maddubs_epi16(nibbles, _mm512_set1_epi16(0x0110));
+        let bytes = _mm512_cvtepi16_epi8(pairs);
+        _mm256_storeu_si256(dst.add(i * 32) as *mut __m256i, bytes);
+    }
+}}
+
+fn write_reverse_plain(content: &[u8], len: usize, out: &mut impl Write) -> io::Result<()> {
+    let mut decoded = vec![0u8; len];
+    let mut dst = 0usize;
+    let avx512 = cpu_avx512();
+    for line in content.split(|&b| b == b'\n') {
+        if line.is_empty() { continue; }
+        let blocks = line.len() / 64;
+        if blocks > 0 {
+            #[cfg(target_arch = "x86_64")]
+            if avx512 {
+                unsafe { reverse_hex64(decoded.as_mut_ptr().add(dst), line.as_ptr(), blocks); }
+                dst += blocks * 32;
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = avx512;
+        }
+        let start = if avx512 { blocks * 64 } else { 0 };
+        let mut i = start;
+        while i < line.len() {
+            decoded[dst] = (hex_digit(line[i]) << 4) | hex_digit(line[i + 1]);
+            dst += 1;
+            i += 2;
+        }
+    }
+    out.write_all(&decoded)?;
+    out.flush()
+}
+
 fn run_reverse(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(WRITE_BUF, stdout.lock());
@@ -2882,11 +3530,17 @@ fn run_reverse(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
     let mut content = Vec::new();
     reader.read_to_end(&mut content)?;
 
-    // Check if the input contains any ':' (canonical mode)
+    if jump_off == 0 {
+        if let Some(len) = reverse_plain_hex_len(&content) {
+            return write_reverse_plain(&content, len, &mut out);
+        }
+    }
     let is_canonical = content.iter().any(|&b| b == b':');
 
     let mut output_offset = 0u64;
+    let mut decoded_output = Vec::new();
     let mut last_line_bytes: Vec<u8> = Vec::new();
+    let mut current_line_bytes: Vec<u8> = Vec::new();
     let mut squeezing = false;
 
     for line in content.split(|&b| b == b'\n') {
@@ -2903,16 +3557,18 @@ fn run_reverse(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
         let offset_start = pos;
         while pos < line.len() && (line[pos].is_ascii_hexdigit() || line[pos] == b'x') { pos += 1; }
         let offset_end = pos;
-        
+
         let has_sep = pos < line.len() && (line[pos] == b':' || line[pos] == b' ');
-        
-        // In canonical mode, a line without a separator is the final offset line.
+
         if is_canonical && !has_sep {
-            // Update output_offset in case we were squeezing
+
             if squeezing && !last_line_bytes.is_empty() {
-                let line_off = std::str::from_utf8(&line[offset_start..offset_end]).unwrap_or("");
-                let line_off = u64::from_str_radix(line_off, 16).unwrap_or(output_offset);
+                let line_off = parse_reverse_hex(&line[offset_start..offset_end]).unwrap_or(output_offset);
                 let repeat = if last_line_bytes.is_empty() { 0 } else { (line_off - output_offset) / last_line_bytes.len() as u64 };
+                if !decoded_output.is_empty() {
+                    out.write_all(&decoded_output)?;
+                    decoded_output.clear();
+                }
                 for _ in 0..repeat {
                     out.write_all(&last_line_bytes)?;
                 }
@@ -2923,15 +3579,19 @@ fn run_reverse(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
         }
 
         let line_off = if has_sep && offset_end > offset_start {
-            let s = std::str::from_utf8(&line[offset_start..offset_end]).unwrap_or("");
-            let base = if s.starts_with("0x") { &s[2..] } else { s };
-            u64::from_str_radix(base, 16).unwrap_or(output_offset)
+            let s = &line[offset_start..offset_end];
+            let base = if s.starts_with(b"0x") { &s[2..] } else { s };
+            parse_reverse_hex(base).unwrap_or(output_offset)
         } else { output_offset };
 
         if line_off < jump_off { continue; }
 
         if squeezing && !last_line_bytes.is_empty() {
             let repeat = if last_line_bytes.is_empty() { 0 } else { (line_off - output_offset) / last_line_bytes.len() as u64 };
+            if !decoded_output.is_empty() {
+                out.write_all(&decoded_output)?;
+                decoded_output.clear();
+            }
             for _ in 0..repeat {
                 out.write_all(&last_line_bytes)?;
             }
@@ -2945,14 +3605,15 @@ fn run_reverse(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
             pos = offset_start;
         }
 
-        let mut current_line_bytes = Vec::new();
+        current_line_bytes.clear();
 
         while pos < line.len() && line[pos] == b' ' { pos += 1; }
         while pos < line.len() && line[pos] != b'|' {
             if line[pos] == b' ' { pos += 1; continue; }
-            if pos + 1 < line.len() && line[pos].is_ascii_hexdigit() && line[pos+1].is_ascii_hexdigit() {
-                let hi = hex_digit(line[pos]);
-                let lo = hex_digit(line[pos+1]);
+            if pos + 1 < line.len() {
+                let hi = HEX_VALUES[line[pos] as usize];
+                let lo = HEX_VALUES[line[pos + 1] as usize];
+                if hi == 0xff || lo == 0xff { break; }
                 let byte = (hi << 4) | lo;
                 current_line_bytes.push(byte);
                 pos += 2;
@@ -2960,11 +3621,12 @@ fn run_reverse(opts: &Options, reader: &mut dyn Read) -> io::Result<()> {
         }
 
         if !current_line_bytes.is_empty() {
-            out.write_all(&current_line_bytes)?;
+            decoded_output.extend_from_slice(&current_line_bytes);
             output_offset += current_line_bytes.len() as u64;
-            last_line_bytes = current_line_bytes;
+            std::mem::swap(&mut last_line_bytes, &mut current_line_bytes);
         }
     }
+    out.write_all(&decoded_output)?;
     out.flush()
 }
 
@@ -2977,26 +3639,31 @@ fn hex_digit(b: u8) -> u8 {
     }
 }
 
-/// Minimal hexdump -e format interpreter.
-/// Supports: 'N/M "fmt"' where fmt can have %02x %03o %05d %_c %08_ax %08_Ad
 fn run_custom_format(opts: &Options, data: &[u8], start_off: u64) -> io::Result<()> {
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(WRITE_BUF, stdout.lock());
 
-    // Parse each format string into a list of units: (count, size, fmt_str)
-    struct Unit { count: usize, size: usize, fmt: String }
+    enum CustomFmt {
+        OffsetHex(String),
+        OffsetDecimal(String),
+        Char,
+        Hex,
+        Octal,
+        Decimal,
+        Literal(String),
+    }
+    struct Unit { count: usize, size: usize, fmt: CustomFmt }
     let mut units: Vec<Unit> = Vec::new();
 
     for fmtstr in &opts.formats {
         let s = fmtstr.trim();
-        // Pattern: [count/size] "fmt_string" ["sep_string"]
+
         let mut pos = 0usize;
         while pos < s.len() {
-            // skip whitespace
+
             while pos < s.len() && s.as_bytes()[pos] == b' ' { pos += 1; }
             if pos >= s.len() { break; }
 
-            // check for count/size prefix
             let mut count = 1;
             let mut size = 1;
             let has_prefix = s.as_bytes()[pos].is_ascii_digit();
@@ -3010,11 +3677,10 @@ fn run_custom_format(opts: &Options, data: &[u8], start_off: u64) -> io::Result<
                     size = s[pos..ne].parse().unwrap_or(1);
                     pos = ne;
                 }
-                // skip whitespace
+
                 while pos < s.len() && s.as_bytes()[pos] == b' ' { pos += 1; }
             }
 
-            // quoted format string
             if pos < s.len() && s.as_bytes()[pos] == b'"' {
                 pos += 1;
                 let mut fmt = String::new();
@@ -3032,29 +3698,43 @@ fn run_custom_format(opts: &Options, data: &[u8], start_off: u64) -> io::Result<
                         pos += 1;
                     }
                 }
-                if pos < s.len() { pos += 1; } // closing "
-                
-                // If no explicit size was given and the string has no format specifiers, size = 0.
+                if pos < s.len() { pos += 1; }
+
                 let has_fmt_spec = fmt.contains('%') || fmt.contains("_ax") || fmt.contains("_Ax") || fmt.contains("_Ad");
                 if !has_fmt_spec && !has_prefix {
                     size = 0;
                 }
-                units.push(Unit { count, size, fmt });
+                let compiled = if fmt.contains("_ax") || fmt.contains("_Ax") {
+                    CustomFmt::OffsetHex(fmt.split(|c| c == 'x' || c == 'X').last().unwrap_or("").to_string())
+                } else if fmt.contains("_Ad") {
+                    CustomFmt::OffsetDecimal(fmt.split('d').last().unwrap_or("").to_string())
+                } else if fmt.contains("%_c") {
+                    CustomFmt::Char
+                } else if fmt.contains("%02x") {
+                    CustomFmt::Hex
+                } else if fmt.contains("%03o") {
+                    CustomFmt::Octal
+                } else if fmt.contains("%05d") {
+                    CustomFmt::Decimal
+                } else {
+                    CustomFmt::Literal(fmt)
+                };
+                units.push(Unit { count, size, fmt: compiled });
             } else {
-                pos += 1; // skip unknown char
+                pos += 1;
             }
         }
     }
 
-    let _hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
     let mut data_pos = 0usize;
     let row_size: usize = units.iter().map(|u| u.count * u.size).sum::<usize>().max(1);
+    let mut pending = Vec::with_capacity(WRITE_BUF);
+    let mut number = [0u8; 20];
 
     while data_pos < data.len() {
         let mut cur = data_pos;
         for unit in &units {
             for _ in 0..unit.count {
-                // apply fmt to cur..cur+unit.size
                 let slice = &data[cur.min(data.len())..data.len()];
                 let val: u64 = if !slice.is_empty() {
                     let take = unit.size.min(slice.len());
@@ -3062,42 +3742,47 @@ fn run_custom_format(opts: &Options, data: &[u8], start_off: u64) -> io::Result<
                 } else { 0 };
                 let b = if !slice.is_empty() { slice[0] } else { 0 };
 
-                // interpret format specifier
-                let fmt = &unit.fmt;
-                if fmt.contains("_ax") || fmt.contains("_Ax") {
-                    // offset in hex
-                    let off = start_off + cur as u64;
-                    let s = format!("{:08x}", off);
-                    let rest = fmt.split(|c| c == 'x' || c == 'X').last().unwrap_or("");
-                    out.write_all(s.as_bytes())?;
-                    out.write_all(rest.as_bytes())?;
-                } else if fmt.contains("_Ad") {
-                    let off = start_off + cur as u64;
-                    let s = format!("{:08}", off);
-                    let rest = fmt.split('d').last().unwrap_or("");
-                    out.write_all(s.as_bytes())?;
-                    out.write_all(rest.as_bytes())?;
-                } else if fmt.contains("%_c") {
-                    let c = if b >= 0x20 && b <= 0x7e { b as char } else { '.' };
-                    out.write_all(c.to_string().as_bytes())?;
-                } else if fmt.contains("%02x") {
-                    let s = format!("{:02x} ", b);
-                    out.write_all(s.as_bytes())?;
-                } else if fmt.contains("%03o") {
-                    let s = format!("{:03o} ", b);
-                    out.write_all(s.as_bytes())?;
-                } else if fmt.contains("%05d") {
-                    let s = format!("{:05} ", val as u16);
-                    out.write_all(s.as_bytes())?;
-                } else {
-                    // literal
-                    out.write_all(fmt.as_bytes())?;
+                match &unit.fmt {
+                    CustomFmt::OffsetHex(rest) => {
+                        let off = start_off + cur as u64;
+                        let len = write_offset(&mut number, off, false, false);
+                        pending.extend_from_slice(&number[..len]);
+                        pending.extend_from_slice(rest.as_bytes());
+                    }
+                    CustomFmt::OffsetDecimal(rest) => {
+                        let off = start_off + cur as u64;
+                        let len = write_offset(&mut number, off, true, false);
+                        pending.extend_from_slice(&number[..len]);
+                        pending.extend_from_slice(rest.as_bytes());
+                    }
+                    CustomFmt::Char => {
+                        pending.push(if (0x20..=0x7e).contains(&b) { b } else { b'.' });
+                    }
+                    CustomFmt::Hex => {
+                        pending.push(HEX_LOWER[(b >> 4) as usize]);
+                        pending.push(HEX_LOWER[(b & 0xf) as usize]);
+                        pending.push(b' ');
+                    }
+                    CustomFmt::Octal => {
+                        pending.extend_from_slice(&OCT3[b as usize]);
+                        pending.push(b' ');
+                    }
+                    CustomFmt::Decimal => {
+                        pending.extend_from_slice(&DEC5[val as u16 as usize]);
+                        pending.push(b' ');
+                    }
+                    CustomFmt::Literal(literal) => pending.extend_from_slice(literal.as_bytes()),
                 }
                 cur += unit.size;
             }
         }
+        if pending.len() >= WRITE_BUF {
+            out.write_all(&pending)?;
+            pending.clear();
+        }
         data_pos += row_size;
     }
+    out.write_all(&pending)?;
     out.flush()
 }
 
@@ -3247,12 +3932,10 @@ fn output_line(
     let n         = src.len();
     let hex       = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
 
-    // Row building
     let left_bar  = match border { BorderStyle::None=>"", BorderStyle::Ascii=>"|", BorderStyle::Unicode=>"│" };
     let mid_bar   = left_bar;
     let right_bar = left_bar;
 
-    // Position column
     if has_pos {
         if border != BorderStyle::None { out.write_all(left_bar.as_bytes())?; }
         if do_color { out.write_all(ANSI_CYAN.as_bytes())?; }
@@ -3270,7 +3953,6 @@ fn output_line(
         }
     }
 
-    // Hex section
     if border != BorderStyle::None {
         if !has_pos { out.write_all(left_bar.as_bytes())?; }
         else        { out.write_all(mid_bar.as_bytes())?; }
@@ -3283,7 +3965,7 @@ fn output_line(
                 if i == half { out.write_all(b" ")?; }
                 if i < n {
                     let b = src[i];
-                    if do_color { out.write_all(byte_ansi(b, opts.scheme).as_bytes())?; }
+                    if do_color { out.write_all(byte_ansi(b, opts.scheme))?; }
                     out.write_all(&[hex[(b>>4) as usize], hex[(b&0xf) as usize]])?;
                     if do_color { out.write_all(ANSI_RESET.as_bytes())?; }
                     if i < opts.width - 1 { out.write_all(b" ")?; }
@@ -3296,7 +3978,6 @@ fn output_line(
         _ => unreachable!("non-canonical handled above"),
     }
 
-    // ASCII panel
     if has_ascii {
         if border != BorderStyle::None {
             out.write_all(b" ")?;
@@ -3309,14 +3990,10 @@ fn output_line(
             if do_color {
                 if b >= 0x20 && b <= 0x7e { out.write_all(b"\x1b[32m")?; }
                 else                      { out.write_all(ANSI_DIM.as_bytes())?; }
-                let mut ab = Vec::new();
-                ascii_byte(b, opts.table, &mut ab);
-                out.write_all(&ab)?;
+                write_ascii_byte(out, b, opts.table)?;
                 out.write_all(ANSI_RESET.as_bytes())?;
             } else {
-                let mut ab = Vec::new();
-                ascii_byte(b, opts.table, &mut ab);
-                out.write_all(&ab)?;
+                write_ascii_byte(out, b, opts.table)?;
             }
         }
         let ascii_pad = ascii_width(opts).saturating_sub(n);
@@ -3337,6 +4014,205 @@ fn output_line(
     out.write_all(b"\n")
 }
 
+#[inline(always)]
+fn glyph_len(b: u8, table: CharTable) -> usize {
+    match table {
+        CharTable::Ascii | CharTable::Ebcdic => 1,
+        CharTable::Braille => 3,
+        CharTable::Cp437 => CP437_UTF8_DATA.1[b as usize] as usize,
+        CharTable::Default => if b == 0 || b == 0x20 || (0x21..=0x7e).contains(&b) {
+            if b == 0 { 3 } else { 1 }
+        } else {
+            3
+        },
+    }
+}
+
+#[inline(always)]
+fn format_output_line_raw(dst: &mut Vec<u8>, src: &[u8], off: u64, opts: &Options, do_color: bool) {
+    let width = opts.width;
+    let hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+    let mut tmp = [0u8; 20];
+    let olen = write_offset(&mut tmp, off, opts.offset_dec, opts.uppercase);
+    let needed = if do_color {
+        let glyphs: usize = src.iter().map(|&b| glyph_len(b, opts.table)).sum();
+        let needed = olen + width * 3 + glyphs + 15 + width * 18;
+        dst.reserve(needed);
+        needed
+    } else {
+        dst.capacity() - dst.len()
+    };
+    unsafe {
+        let base = dst.as_mut_ptr().add(dst.len());
+        let mut p = base;
+        if do_color {
+            std::ptr::copy_nonoverlapping(ANSI_CYAN.as_bytes().as_ptr(), p, 5);
+            p = p.add(5);
+        }
+        std::ptr::copy_nonoverlapping(tmp.as_ptr(), p, olen);
+        p = p.add(olen);
+        *p = b':';
+        p = p.add(1);
+        if do_color {
+            std::ptr::copy_nonoverlapping(ANSI_RESET.as_bytes().as_ptr(), p, 4);
+            p = p.add(4);
+        }
+        *p = b' ';
+        p = p.add(1);
+        for i in 0..width {
+            if i == width / 2 {
+                *p = b' ';
+                p = p.add(1);
+            }
+            let b = src[i];
+            if do_color {
+                let ansi = byte_ansi(b, opts.scheme);
+                std::ptr::copy_nonoverlapping(ansi.as_ptr(), p, 5);
+                p = p.add(5);
+            }
+            *p = hex[(b >> 4) as usize];
+            *p.add(1) = hex[(b & 0xf) as usize];
+            p = p.add(2);
+            if do_color {
+                std::ptr::copy_nonoverlapping(ANSI_RESET.as_bytes().as_ptr(), p, 4);
+                p = p.add(4);
+            }
+            if i < width - 1 {
+                *p = b' ';
+                p = p.add(1);
+            }
+        }
+        *p = b' ';
+        *p.add(1) = b'|';
+        p = p.add(2);
+        for &b in src {
+            if do_color {
+                let ansi = if (0x20..=0x7e).contains(&b) { b"\x1b[32m" } else { ANSI_DIM.as_bytes() };
+                std::ptr::copy_nonoverlapping(ansi.as_ptr(), p, 5);
+                p = p.add(5);
+            }
+            match opts.table {
+                CharTable::Ascii => {
+                    *p = if (0x20..=0x7e).contains(&b) { b } else { b'.' };
+                    p = p.add(1);
+                }
+                CharTable::Default => {
+                    if b == 0 {
+                        std::ptr::copy_nonoverlapping("⋄".as_bytes().as_ptr(), p, 3);
+                        p = p.add(3);
+                    } else if b == 0x20 || (0x21..=0x7e).contains(&b) {
+                        *p = b;
+                        p = p.add(1);
+                    } else {
+                        std::ptr::copy_nonoverlapping("•".as_bytes().as_ptr(), p, 3);
+                        p = p.add(3);
+                    }
+                }
+                CharTable::Braille => {
+                    let encoded = braille_for_byte(b);
+                    std::ptr::copy_nonoverlapping(encoded.as_ptr(), p, 3);
+                    p = p.add(3);
+                }
+                CharTable::Cp437 => {
+                    let i = b as usize;
+                    let len = CP437_UTF8_DATA.1[i] as usize;
+                    std::ptr::copy_nonoverlapping(CP437_UTF8_DATA.0[i].as_ptr(), p, len);
+                    p = p.add(len);
+                }
+                CharTable::Ebcdic => {
+                    let c = EBCDIC_TO_ASCII[b as usize];
+                    *p = if (0x20..=0x7e).contains(&c) { c } else { b'.' };
+                    p = p.add(1);
+                }
+            }
+            if do_color {
+                std::ptr::copy_nonoverlapping(ANSI_RESET.as_bytes().as_ptr(), p, 4);
+                p = p.add(4);
+            }
+        }
+        *p = b'|';
+        *p.add(1) = b'\n';
+        p = p.add(2);
+        debug_assert_eq!(p.offset_from(base) as usize, needed);
+        dst.set_len(dst.len() + needed);
+    }
+    return;
+}
+
+fn format_output_line(dst: &mut Vec<u8>, src: &[u8], off: u64, opts: &Options, do_color: bool) {
+    if output_line_diverts(opts) {
+        format_row_generic(dst, src, off, opts);
+        return;
+    }
+    if opts.border == BorderStyle::None && src.len() == opts.width
+        && (do_color || opts.table == CharTable::Ascii) {
+        format_output_line_raw(dst, src, off, opts, do_color);
+        return;
+    }
+    let n = src.len();
+    let hex = if opts.uppercase { HEX_UPPER } else { HEX_LOWER };
+    let border = opts.border;
+    let bar = match border { BorderStyle::None => "", BorderStyle::Ascii => "|", BorderStyle::Unicode => "│" };
+
+    if border != BorderStyle::None { dst.extend_from_slice(bar.as_bytes()); }
+    if do_color { dst.extend_from_slice(ANSI_CYAN.as_bytes()); }
+    let mut tmp = [0u8; 20];
+    let olen = write_offset(&mut tmp, off, opts.offset_dec, opts.uppercase);
+    dst.extend_from_slice(&tmp[..olen]);
+    dst.push(b':');
+    if do_color { dst.extend_from_slice(ANSI_RESET.as_bytes()); }
+    if border != BorderStyle::None {
+        let pos_w = if opts.offset_dec { 20 } else { offset_len(u64::MAX) } + 1;
+        let pad = pos_w.saturating_sub(olen + 1);
+        dst.resize(dst.len() + pad, b' ');
+        dst.extend_from_slice(bar.as_bytes());
+    } else {
+        dst.push(b' ');
+    }
+
+    let half = opts.width / 2;
+    for i in 0..opts.width {
+        if i == half { dst.push(b' '); }
+        if i < n {
+            let b = src[i];
+            if do_color { dst.extend_from_slice(byte_ansi(b, opts.scheme)); }
+            dst.push(hex[(b >> 4) as usize]);
+            dst.push(hex[(b & 0xf) as usize]);
+            if do_color { dst.extend_from_slice(ANSI_RESET.as_bytes()); }
+            if i < opts.width - 1 { dst.push(b' '); }
+        } else {
+            dst.extend_from_slice(b"  ");
+            if i < opts.width - 1 { dst.push(b' '); }
+        }
+    }
+
+    if border != BorderStyle::None {
+        dst.push(b' ');
+        dst.extend_from_slice(bar.as_bytes());
+    } else {
+        dst.extend_from_slice(b" |");
+    }
+    for &b in src {
+        if do_color {
+            if (0x20..=0x7e).contains(&b) { dst.extend_from_slice(b"\x1b[32m"); }
+            else { dst.extend_from_slice(ANSI_DIM.as_bytes()); }
+            ascii_byte(b, opts.table, dst);
+            dst.extend_from_slice(ANSI_RESET.as_bytes());
+        } else {
+            ascii_byte(b, opts.table, dst);
+        }
+    }
+    let pad = ascii_width(opts).saturating_sub(n);
+    dst.resize(dst.len() + pad, b' ');
+    if border != BorderStyle::None {
+        dst.push(b' ');
+        dst.extend_from_slice(bar.as_bytes());
+    } else {
+        dst.push(b'|');
+    }
+    dst.push(b'\n');
+}
+
 fn use_color(opts: &Options) -> bool {
     match opts.color {
         ColorWhen::Always => true,
@@ -3345,7 +4221,6 @@ fn use_color(opts: &Options) -> bool {
     }
 }
 
-/// True iff we can use the SIMD canonical fast path (no generic overhead).
 fn is_simd_eligible(opts: &Options, do_color: bool) -> bool {
     matches!(opts.mode, DisplayMode::Canonical
         | DisplayMode::OneByteHex
@@ -3381,7 +4256,6 @@ fn output_line_diverts(opts: &Options) -> bool {
         || opts.no_ascii
 }
 
-/// Multi-file concatenated reader.
 struct MultiReader {
     files: Vec<String>,
     idx:   usize,
@@ -3416,7 +4290,7 @@ impl Read for MultiReader {
                 Some(ref mut r) => {
                     let n = r.read(buf)?;
                     if n > 0 { return Ok(n); }
-                    // EOF on this file, try next
+
                 }
             }
             self.advance()?;
@@ -3458,7 +4332,7 @@ fn main() -> io::Result<()> {
 
     if let Some(ref file) = single_file {
         if let Ok(mmap) = unsafe { Mmap::map(file) } {
-            // Resolve skip (negative = from end)
+
             let file_len = mmap.len() as i64;
             let skip_abs: usize = if opts.skip < 0 {
                 (file_len + opts.skip).max(0) as usize
@@ -3477,10 +4351,8 @@ fn main() -> io::Result<()> {
                 libc::madvise(data.as_ptr() as *mut libc::c_void, data.len(), libc::MADV_SEQUENTIAL);
             }
 
-            // Display offset = file position + jump bias
             let start_disp: u64 = (skip_abs as i64 + opts.jump) as u64;
 
-            // Plain / CInclude / custom format
             match opts.mode {
                 DisplayMode::Plain => {
                     return run_plain_mmap(&opts, data);
@@ -3505,7 +4377,7 @@ fn main() -> io::Result<()> {
                 && opts.table == CharTable::Ascii
                 && opts.border == BorderStyle::None
                 && !opts.no_ascii;
-            let serial_only = opts.squeeze || opts.max_lines.is_some();
+            let serial_only = opts.squeeze || opts.max_lines.is_some() || data.len() <= 64 * 1024;
             if serial_only {
                 return run_serial_mmap(&opts, data, start_disp, do_color, use_simd, use_avx2);
             }
@@ -3523,7 +4395,6 @@ fn main() -> io::Result<()> {
         }
     }
 
-    // Build reader
     let files = if opts.files.is_empty() { vec!["-".to_string()] } else { opts.files.clone() };
     let mut reader: Box<dyn Read> = match MultiReader::new(files) {
         Ok(r) => Box::new(r),
@@ -3533,9 +4404,8 @@ fn main() -> io::Result<()> {
         }
     };
 
-    // skip
     if opts.skip != 0 {
-        // Try seek on the first file if single
+
         if let Some(mut f) = single_file {
             if opts.skip >= 0 {
                 f.seek(SeekFrom::Start(opts.skip as u64))?;
@@ -3568,12 +4438,9 @@ fn main() -> io::Result<()> {
 
 fn row_len_delta(opts: &Options, src: &[u8]) -> i64 {
     match opts.mode {
-        DisplayMode::OneByteChar => src.iter().map(|&b| match b {
-            0x00 | 0x07..=0x0d => -1i64,
-            _ => 0,
-        }).sum(),
+        DisplayMode::OneByteChar => src.iter().map(|&b| CHAR_FORMAT[b as usize].1 as i64 - 4).sum(),
         _ => match opts.table {
-            CharTable::Cp437 => src.iter().map(|&b| CP437[b as usize].len_utf8() as i64 - 1).sum(),
+            CharTable::Cp437 => src.iter().map(|&b| CP437_UTF8_DATA.1[b as usize] as i64 - 1).sum(),
             CharTable::Default => src.iter().map(|&b| {
                 if b == 0x00 { 2 } else if b == 0x20 || (0x21..=0x7e).contains(&b) { 0 } else { 2 }
             }).sum(),
@@ -3632,8 +4499,9 @@ fn run_parallel_scalar(
 
     let first = row_len_at(0);
     let last  = if full_rows > 0 { row_len_at(full_rows - 1) } else { first };
-    let nbuf = 6usize;
-    let chunk_rows = ((16 * 1024 * 1024) / first.min(last)).max(1);
+    let nbuf = 2usize;
+    let chunk_target = if file_sz <= 16 * 1024 * 1024 { 4 * 1024 * 1024 } else { 8 * 1024 * 1024 };
+    let chunk_rows = (chunk_target / first.min(last)).max(1).min(full_rows.max(1));
     let buf_cap    = chunk_rows * first.max(last) + 16;
 
     #[cfg(unix)]
@@ -3692,23 +4560,39 @@ fn run_parallel_scalar(
                 chunk_out.resize(payload + 16, 0);
                 {
                     let out_ptr = chunk_out.as_mut_ptr() as usize;
-                    (0..rows).into_par_iter()
-                        .fold(|| Vec::with_capacity(128), |mut v, i| {
-                            v.clear();
+                    if opts.border == BorderStyle::None {
+                        (0..rows).into_par_iter().for_each(|i| {
                             let src_off = (row_cursor + i) * width;
                             let off = start_off.wrapping_add(src_off as u64);
+                            let o0 = offsets[i] as usize;
+                            let capacity = (offsets[i + 1] - offsets[i]) as usize;
+                            let mut v = unsafe { Vec::from_raw_parts((out_ptr + o0) as *mut u8, 0, capacity) };
                             if colored_row {
-                                output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color, 0, 0).unwrap();
+                                format_output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color);
                             } else {
                                 format_row_generic(&mut v, &data[src_off..src_off + width], off, opts);
                             }
-                            let o0 = offsets[i] as usize;
-                            unsafe {
-                                std::slice::from_raw_parts_mut((out_ptr + o0) as *mut u8, v.len()).copy_from_slice(&v);
-                            }
-                            v
-                        })
-                        .for_each(|_| {});
+                            std::mem::forget(v);
+                        });
+                    } else {
+                        (0..rows).into_par_iter()
+                            .fold(|| Vec::with_capacity(128), |mut v, i| {
+                                v.clear();
+                                let src_off = (row_cursor + i) * width;
+                                let off = start_off.wrapping_add(src_off as u64);
+                                if colored_row {
+                                    output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color, 0, 0).unwrap();
+                                } else {
+                                    format_row_generic(&mut v, &data[src_off..src_off + width], off, opts);
+                                }
+                                let o0 = offsets[i] as usize;
+                                unsafe {
+                                    std::slice::from_raw_parts_mut((out_ptr + o0) as *mut u8, v.len()).copy_from_slice(&v);
+                                }
+                                v
+                            })
+                            .for_each(|_| {});
+                    }
                 }
                 chunk_out.truncate(payload);
             } else {
@@ -3719,19 +4603,17 @@ fn run_parallel_scalar(
                     out_rows
                         .par_chunks_mut(row_len)
                         .enumerate()
-                        .fold(|| Vec::with_capacity(row_len + 16), |mut v, (i, row)| {
-                            v.clear();
+                        .for_each(|(i, row)| {
                             let src_off = (row_cursor + i) * width;
                             let off = start_off.wrapping_add(src_off as u64);
+                            let mut v = unsafe { Vec::from_raw_parts(row.as_mut_ptr(), 0, row_len) };
                             if colored_row {
-                                output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color, 0, 0).unwrap();
+                                format_output_line(&mut v, &data[src_off..src_off + width], off, opts, do_color);
                             } else {
                                 format_row_generic(&mut v, &data[src_off..src_off + width], off, opts);
                             }
-                            row[..v.len().min(row_len)].copy_from_slice(&v[..v.len().min(row_len)]);
-                            v
-                        })
-                        .for_each(|_| {});
+                            std::mem::forget(v);
+                        });
                 }
                 chunk_out.truncate(payload);
             }
@@ -3749,7 +4631,7 @@ fn run_parallel_scalar(
         let off     = start_off.wrapping_add(src_off as u64);
         let mut v = Vec::with_capacity(256);
         if colored_row {
-            output_line(&mut v, &data[src_off..], off, opts, do_color, 0, 0)?;
+            format_output_line(&mut v, &data[src_off..], off, opts, do_color);
         } else {
             format_row_generic(&mut v, &data[src_off..], off, opts);
         }
@@ -3836,8 +4718,9 @@ fn run_parallel_mmap(
 
     let first = row_len_at(0);
     let last  = if full_rows > 0 { row_len_at(full_rows - 1) } else { first };
-    let nbuf = 6usize;
-    let chunk_rows = ((16 * 1024 * 1024) / first.min(last)).max(1);
+    let nbuf = 2usize;
+    let chunk_target = if file_sz <= 16 * 1024 * 1024 { 4 * 1024 * 1024 } else { 8 * 1024 * 1024 };
+    let chunk_rows = (chunk_target / first.min(last)).max(1).min(full_rows.max(1));
     let buf_cap    = chunk_rows * first.max(last) + 16;
 
     #[cfg(unix)]
@@ -4178,7 +5061,6 @@ fn run_serial_mmap(
     let stdout = io::stdout();
     let mut out = BufWriter::with_capacity(WRITE_BUF, stdout.lock());
 
-    // Border top
     let pos_w = if opts.no_position { 0 } else {
         (if opts.offset_dec { 20 } else { offset_len(u64::MAX) }) + 1
     };
@@ -4220,6 +5102,7 @@ fn run_serial_mmap(
         && start_off.wrapping_add(((full_rows.saturating_sub(1)) * bpr) as u64) <= 0xFFFF_FFFF;
     let run_ok                  = (pair_ok && core.and_then(|c| c.full.fast.as_ref()).is_some() || min_ser)
         && !opts.offset_dec
+        && !opts.no_position
         && start_off.wrapping_add(((full_rows.saturating_sub(1)) * bpr) as u64) <= 0xFFFF_FFFF;
 
     if run_ok {
@@ -4307,7 +5190,6 @@ fn run_serial_mmap(
         let row_data   = &data[src_off..src_off + bpr];
         let disp_off   = start_off.wrapping_add(src_off as u64);
 
-        // Squeeze
         if opts.squeeze && row_data == prev_row.as_slice() {
             if !squeezed { out.write_all(b"*\n")?; squeezed = true; if opts.max_lines.is_some() { lines_written += 1; } }
             r += 1;
@@ -4361,7 +5243,7 @@ fn run_serial_mmap(
         border_bottom(&mut out, pos_w, hex_w, ascii_w, !opts.no_position,
                       has_ascii, opts.border)?;
     } else if !opts.no_position {
-        // Final offset line (like xxd) — only printed if no border
+
         let final_off = start_off.wrapping_add(file_sz as u64);
         let mut tmp = [0u8; 20];
         let olen = write_offset(&mut tmp, final_off, opts.offset_dec, opts.uppercase);
@@ -4383,7 +5265,6 @@ fn run_streaming(
 ) -> io::Result<()> {
     let bpr = opts.width;
 
-    // Display offset = skip + jump
     let display_start: u64 = (opts.skip + opts.jump) as u64;
 
     let stdout = io::stdout();
@@ -4430,7 +5311,6 @@ fn run_streaming(
     let mut squeezed          = false;
     let mut lines_written: u64 = 0;
 
-    // Partial-row carry buffer
     let mut carry     = vec![0u8; bpr];
     let mut carry_len = 0usize;
 
@@ -4446,16 +5326,13 @@ fn run_streaming(
         if n == 0 { break; }
         total_read += n as u64;
 
-        // Merge carry + new data
         let _data_start = 0usize;
         let _input: &[u8];
 
-        // Fast path: combine carry + new bytes into a contiguous buffer
         let combined_len = carry_len + n;
         let full_rows = combined_len / bpr;
         let new_tail  = combined_len % bpr;
 
-        // build a temp buffer only if there's a carry
         let scratch: Vec<u8>;
         let combined: &[u8] = if carry_len > 0 {
             scratch = {
@@ -4543,7 +5420,6 @@ fn run_streaming(
             if opts.max_lines.map_or(false, |m| lines_written >= m) { break; }
             let src = &combined[r * bpr..(r + 1) * bpr];
 
-            // Squeeze
             if opts.squeeze && src == prev_row.as_slice() {
                 if !squeezed {
                     if wpos > 0 { out.write_all(&wbuf[..wpos])?; wpos = 0; }
@@ -4598,14 +5474,12 @@ fn run_streaming(
             r += 1;
         }
 
-        // Save tail into carry
         carry_len = new_tail;
         if new_tail > 0 {
             carry[..new_tail].copy_from_slice(&combined[full_rows * bpr..]);
         }
     }
 
-    // Flush remaining carry (partial row)
     if carry_len > 0 && opts.max_lines.map_or(true, |m| lines_written < m) {
         let src = &carry[..carry_len];
         if simd_eligible {
@@ -4631,7 +5505,6 @@ fn run_streaming(
 
     if wpos > 0 { out.write_all(&wbuf[..wpos])?; }
 
-    // Final offset line
     {
         let mut tmp = [0u8; 20];
         let olen = write_offset(&mut tmp, offset, opts.offset_dec, opts.uppercase);
@@ -4642,7 +5515,7 @@ fn run_streaming(
     }
 
     if opts.squeeze {
-        // Already handled inline
+
     }
 
     if opts.border != BorderStyle::None {
