@@ -40,27 +40,36 @@ fasthex /path/to/file
 
 ## Benchmarks
 
-These are Hyperfine wall-clock means with stdout redirected to `/dev/null`. The 5 GiB canonical case used 2 runs per tool, the 16 MiB canonical case used 3, and the 16 MiB plain case used 10. Times are reported as mean ± standard deviation.
-
 | File | Mode | Tool | Mean wall time | fasthex speedup |
 |---|---|---|---:|---:|
-| **random-5GiB.bin** | **canonical** | **fasthex 0.3.7** | **3.553 ± 0.038 s** | **—** |
-| random-5GiB.bin | canonical | xxd | 219.292 ± 1.465 s | 61.7× |
-| **fasthex-16MiB.bin** | **canonical** | **fasthex 0.3.7** | **49.6 ± 17.0 ms** | **—** |
-| fasthex-16MiB.bin | canonical | xxd | 1280.6 ± 344.3 ms | 25.8× |
-| fasthex-16MiB.bin | canonical | hexdump | 4368.4 ± 159.3 ms | 88.1× |
-| fasthex-16MiB.bin | canonical | hexyl | 719.3 ± 66.7 ms | 14.5× |
-| **fasthex-16MiB.bin** | **plain hex** | **fasthex 0.3.7** | **54.1 ± 20.9 ms** | **—** |
-| fasthex-16MiB.bin | plain hex | xxd | 319.1 ± 54.4 ms | 5.9× |
+| **random-5GiB.bin** | **canonical** | **fasthex 0.3.7** | **3.937 ± 0.451 s** | **—** |
+| random-5GiB.bin | canonical | HastyHex | 22.958 ± 0.602 s | 5.8× |
+| **fasthex-16MiB.bin** | **canonical** | **fasthex 0.3.7** | **21.4 ± 1.1 ms** | **—** |
+| fasthex-16MiB.bin | canonical | HastyHex | 68.5 ± 1.3 ms | 3.2× |
+| fasthex-16MiB.bin | canonical | hexyl | 555.5 ± 18.6 ms | 25.9× |
+| fasthex-16MiB.bin | canonical | xxd | 709.6 ± 20.5 ms | 33.1× |
+| fasthex-16MiB.bin | canonical | hexdump | 3367.8 ± 117.6 ms | 157.1× |
+| **fasthex-16MiB.bin** | **plain hex** | **fasthex 0.3.7** | **26.5 ± 6.4 ms** | **—** |
+| fasthex-16MiB.bin | plain hex | xxd | 226.0 ± 3.2 ms | 8.5× |
 
 Reproduce with Hyperfine:
 
 ```bash
-hyperfine --shell=default --warmup 0 --runs 2   './target/release/fasthex "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'   'xxd "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
+hyperfine --shell=default --warmup 0 --runs 2 \
+  --prepare 'cat "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null' \
+  './target/release/fasthex "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null' \
+  '/tmp/hastyhex/hastyhex -p -f < "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
 
-hyperfine --shell=default --warmup 1 --runs 3   './target/release/fasthex /tmp/fasthex-16MiB.bin > /dev/null'   'xxd /tmp/fasthex-16MiB.bin > /dev/null'   'hexdump -v -C /tmp/fasthex-16MiB.bin > /dev/null'   'hexyl --color=never --border=none --character-table=ascii -v /tmp/fasthex-16MiB.bin > /dev/null'
+hyperfine --shell=default --warmup 1 --runs 3 \
+  './target/release/fasthex /tmp/fasthex-16MiB.bin > /dev/null' \
+  'xxd -g 1 -c 16 /tmp/fasthex-16MiB.bin > /dev/null' \
+  'hexdump -v -C /tmp/fasthex-16MiB.bin > /dev/null' \
+  'hexyl --color=never --border=none --character-table=ascii -v /tmp/fasthex-16MiB.bin > /dev/null' \
+  '/tmp/hastyhex/hastyhex -p -f < /tmp/fasthex-16MiB.bin > /dev/null'
 
-hyperfine --shell=default --warmup 1 --runs 10   './target/release/fasthex -p /tmp/fasthex-16MiB.bin > /dev/null'   'xxd -ps /tmp/fasthex-16MiB.bin > /dev/null'
+hyperfine --shell=default --warmup 1 --runs 10 \
+  './target/release/fasthex -p /tmp/fasthex-16MiB.bin > /dev/null' \
+  'xxd -p -c 0 /tmp/fasthex-16MiB.bin > /dev/null'
 ```
 
 ## Uninstall
