@@ -44,6 +44,7 @@ fasthex /path/to/file
 |---|---|---|---:|---:|
 | **random-5GiB.bin** | **canonical** | **fasthex 0.3.7** | **3.937 ± 0.451 s** | **—** |
 | random-5GiB.bin | canonical | HastyHex | 22.958 ± 0.602 s | 5.8× |
+| random-5GiB.bin | canonical | xxd | 251.182 ± 24.917 s | 63.8× |
 | **fasthex-16MiB.bin** | **canonical** | **fasthex 0.3.7** | **21.4 ± 1.1 ms** | **—** |
 | fasthex-16MiB.bin | canonical | HastyHex | 68.5 ± 1.3 ms | 3.2× |
 | fasthex-16MiB.bin | canonical | hexyl | 555.5 ± 18.6 ms | 25.9× |
@@ -59,6 +60,9 @@ hyperfine --shell=default --warmup 0 --runs 2 \
   --prepare 'cat "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null' \
   './target/release/fasthex "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null' \
   '/tmp/hastyhex/hastyhex -p -f < "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
+
+hyperfine --shell=default --warmup 0 --runs 2 \
+  'xxd -g 1 -c 16 "$HOME/benchmark-inputs/random-5GiB.bin" > /dev/null'
 
 hyperfine --shell=default --warmup 1 --runs 3 \
   './target/release/fasthex /tmp/fasthex-16MiB.bin > /dev/null' \
